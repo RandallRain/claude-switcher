@@ -39,6 +39,8 @@
 
 macOS 的 `check`、`checkdetail` 和 `fix` 共用一轮双栈出口/STUN 快照。出口 IP 在 UI 分别显示 IPv4、IPv6 及国家，单个地址族未获取会明确标注；任一观测出口国家异常或全部未获取均失败。时区、地区项显示实际系统时区与 Locale（包含地区名称），不是仅显示目标值。真实地址只用于本机 UI/私有缓存，不要复制到日志或交接输出。
 
+WebRTC 按是否观测到非代理 IP 判色：同版本匹配、部分或全部探针无结果均为绿色，UI 必须说明已匹配的地址族及未取得结果的范围；全部无结果要注明 UDP 出口未验证，不得写成已确认“UDP 不出网、零暴露”。地址不匹配、响应格式异常、探针执行异常、有效地址缺少同版本参考或代理策略无法核验仍为红色。
+
 日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行并连同辅助工件比对去重 → 备份核心与探针/全局规则工件 → 注入配置并同步辅助文件 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 整组回滚）
 
 ## 独立代理诊断
@@ -65,7 +67,7 @@ macOS 的 `check`、`checkdetail` 和 `fix` 共用一轮双栈出口/STUN 快照
 | 修改 App 后界面没变化 | 旧进程没死：App 关窗不退 + `pkill` 匹配中文路径会因 Unicode NFD 编码失配而静默失败 | 用 `pkill -x ClaudeSwitcher`（按进程名）；App 必须实现 `applicationShouldTerminateAfterLastWindowClosed` |
 | headless Chrome 做 WebRTC 检测无结果 | headless 模式 ICE 子系统不产出候选 | 不要走浏览器路线，用本项目的纯 Python STUN 探针 |
 | 代理节点报错但流量没泄漏 | 节点被重置时隧道内请求失败≠泄漏；Fail-Closed 下流量只断不绕 | 换线路即可 |
-| WebRTC 检测失败但 TUN 正常 | 国内 STUN 域名可能命中 DIRECT，或同版本参考不可达/出口分流 | 运行 `fix`，通过 Global Extend Script 添加三端口代理及阻断后备规则，并核验实际内核；勿使用旧 Merge prepend-rules。IPv4/IPv6 分别比较，所有探针无响应是“无法验证”，不是“零暴露” |
+| WebRTC 检测失败但 TUN 正常 | 国内 STUN 域名可能命中 DIRECT，或同版本参考不可达/出口分流 | 运行 `fix`，通过 Global Extend Script 添加三端口代理及阻断后备规则，并核验实际内核；勿使用旧 Merge prepend-rules。IPv4/IPv6 分别比较。无结果显示绿色“未发现非代理 IP”，同时注明未验证；格式/执行异常仍为红色 |
 | 切换账号后对方看到"新设备" | 正常：快照隔离意味着每个账号有独立设备指纹，这正是设计目标 | 无需处理 |
 
 ## 安全红线（Agent 必须遵守）

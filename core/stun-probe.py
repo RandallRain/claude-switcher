@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded IPv4/IPv6 STUN probes and same-family HTTPS egress verification.
 
---audit emits a redacted ok|warn|fail result shared by check/checkdetail/fix.
+--audit emits a redacted ok|fail result shared by check/checkdetail/fix.
 The legacy RESULT output is retained for older callers; no response is UNKNOWN.
 """
 import argparse
@@ -117,7 +117,13 @@ def collect(audit=False, deadline=8.0, include_default=False, probe_stun=True):
     records, references, lock = [], {}, threading.Lock()
 
     def stun_worker(host, port, family):
-        record = stun_public_ip(host, port, family)
+        try:
+            record = stun_public_ip(host, port, family)
+            if not isinstance(record, dict):
+                record = {"state": "probe_error"}
+        except Exception:
+            # Worker failures must not disappear into the no-response case.
+            record = {"state": "probe_error"}
         record.update(transport=4 if family == socket.AF_INET else 6)
         with lock:
             records.append(record)
@@ -167,27 +173,38 @@ def egress_summary(references, country):
 
 
 def evaluate(records, references, country):
-    """Never compare IPv4 with IPv6 or label a timeout 'zero exposure'."""
-    addresses = {normalized_ip(record["address"]) for record in records if record.get("state") == "ok"}
+    """Green means no non-proxy address observed; keep unknown paths explicit."""
+    addresses = set()
+    for record in records:
+        if not isinstance(record, dict) or record.get("state") not in ("ok", "no_response", "unavailable"):
+            return "fail", "检测异常：STUN响应格式错误或探针执行失败"
+        if record["state"] == "ok":
+            try:
+                address = normalized_ip(record["address"])
+                if not address.is_global:
+                    raise ValueError("invalid mapping")
+                addresses.add(address)
+            except (KeyError, TypeError, ValueError):
+                return "fail", "检测异常：STUN地址格式错误"
     if not addresses:
-        return "fail", "STUN均无有效响应，无法验证UDP出口（可能阻断、超时或解析失败）"
+        return "ok", "未发现非代理IP；STUN均无结果（UDP出口未验证）"
     versions = sorted({address.version for address in addresses})
     for version in versions:
         reference = references.get(version, {})
         if reference.get("state") != "ok":
-            return "fail", "IPv%d参考出口不可达，无法验证UDP出口" % version
+            return "fail", "检测异常：IPv%d参考出口不可达，无法核验STUN地址" % version
         if country and reference.get("country") != country:
             return "fail", "IPv%d参考出口国家与目标不一致" % version
         expected = normalized_ip(reference["address"])
         if expected.version != version:
             return "fail", "IPv%d参考出口格式异常" % version
         if any(address != expected for address in addresses if address.version == version):
-            return "fail", "IPv%d UDP出口与同版本参考不一致（疑似直连或代理分流）" % version
+            return "fail", "IPv%d出口与代理参考不一致（疑似非代理IP）" % version
     verified = "/".join("IPv" + str(version) for version in versions)
-    missing = [v for v in (4, 6) if v not in versions and references.get(v, {}).get("state") == "ok"]
+    missing = [v for v in (4, 6) if v not in versions]
     if missing:
-        return "warn", verified + " UDP出口一致；IPv%d STUN无响应，未验证该路径" % missing[0]
-    return "ok", verified + " UDP出口与同版本参考一致"
+        return "ok", "仅见代理IP（" + verified + "）；IPv%d未取得结果" % missing[0]
+    return "ok", "仅见代理IP（" + verified + "）"
 
 
 def main():

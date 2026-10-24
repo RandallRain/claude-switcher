@@ -96,7 +96,7 @@ class DualStackAuditTests(unittest.TestCase):
         result = stun.egress_summary(refs, "SG")
         self.assertEqual(result["status"], "ok")
         self.assertIn("IPv6: " + V6, result["detail"])
-        self.assertEqual(stun.evaluate(records(V4), result["references"], "SG")[0], "warn")
+        self.assertEqual(stun.evaluate(records(V4), result["references"], "SG")[0], "ok")
 
     def test_unavailable_family_is_explicit_and_all_missing_fails(self):
         result = stun.egress_summary(references(4), "SG")
@@ -138,7 +138,7 @@ class DualStackAuditTests(unittest.TestCase):
 
     def test_snapshot_exports_ipc_fields_and_fails_if_udp_audit_fails(self):
         refs=references(4, 6); refs[0]=refs[6]
-        with mock.patch.object(stun, "collect", return_value=([], refs)), \
+        with mock.patch.object(stun, "collect", return_value=(records("9.9.9.9"), refs)), \
              mock.patch("sys.argv", ["stun-probe.py", "--snapshot", "--country", "SG"]), \
              contextlib.redirect_stdout(io.StringIO()) as output:
             code=stun.main()
@@ -157,8 +157,9 @@ class DualStackAuditTests(unittest.TestCase):
 
     def test_ipv6_web_egress_does_not_make_correct_ipv4_stun_fail(self):
         status, detail = stun.evaluate(records(V4), references(4, 6), "SG")
-        self.assertEqual(status, "warn")
-        self.assertIn("IPv6", detail)
+        self.assertEqual(status, "ok")
+        self.assertIn("仅见代理IP（IPv4）", detail)
+        self.assertIn("IPv6未取得结果", detail)
         self.assertNotIn("不一致", detail)
 
     def test_single_stack_networks_can_pass(self):
@@ -176,14 +177,41 @@ class DualStackAuditTests(unittest.TestCase):
         self.assertIn("IPv4", detail)
         self.assertNotIn("9.9.9.9", detail)
 
-    def test_no_reply_or_missing_same_family_reference_never_passes(self):
-        for observed, reference in (([], references(4, 6)),
-                                    ([{"state": "no_response"}], references(4)),
-                                    (records(V4), references(6)), (records(V6), references(4))):
+    def test_no_addresses_is_green_with_an_explicit_unverified_description(self):
+        for observed in ([], [{"state": "no_response"}], [{"state": "unavailable"}]):
+            with self.subTest(observed=observed):
+                status, detail = stun.evaluate(observed, references(4, 6), "SG")
+                self.assertEqual(status, "ok")
+                self.assertIn("未发现非代理IP", detail)
+                self.assertIn("UDP出口未验证", detail)
+                self.assertNotIn("零暴露", detail)
+
+    def test_missing_same_family_reference_is_still_a_detection_error(self):
+        for observed, reference in ((records(V4), references(6)), (records(V6), references(4))):
             with self.subTest(observed=observed):
                 status, detail = stun.evaluate(observed, reference, "SG")
                 self.assertEqual(status, "fail")
+                self.assertIn("检测异常", detail)
                 self.assertNotIn("零暴露", detail)
+
+    def test_invalid_probe_results_are_red_even_when_another_server_matches(self):
+        for invalid in ({"state": "invalid_response"}, {"state": "probe_error"},
+                        {"state": "unexpected"}, {"state": "ok"},
+                        {"state": "ok", "address": "malformed"},
+                        {"state": "ok", "address": "198.18.0.1"}, None):
+            for good in ([], records(V4)):
+                with self.subTest(invalid=invalid, good=good):
+                    status, detail = stun.evaluate(good + [invalid], references(4, 6), "SG")
+                    self.assertEqual(status, "fail")
+                    self.assertIn("检测异常", detail)
+
+    def test_thread_errors_are_preserved_as_detection_errors(self):
+        with mock.patch.object(stun, "stun_public_ip", side_effect=ValueError("sensitive data")):
+            observed, reference = stun.collect()
+        self.assertEqual(len(observed), 8)
+        status, detail = stun.evaluate(observed, reference, "SG")
+        self.assertEqual(status, "fail")
+        self.assertNotIn("sensitive", detail)
 
     def test_reference_country_must_match_locked_target(self):
         self.assertEqual(stun.evaluate(records(V4), references(4), "JP")[0], "fail")
@@ -228,13 +256,14 @@ class DualStackAuditTests(unittest.TestCase):
             with mock.patch.object(stun.subprocess, "run", return_value=process):
                 self.assertNotEqual(stun.reference_egress(4)["state"], "ok")
 
-    def test_main_emits_no_address_and_no_response_is_failure(self):
+    def test_main_emits_no_address_and_no_response_is_green(self):
         with mock.patch.object(stun, "collect", return_value=([], references(4))), \
              mock.patch("sys.argv", ["stun-probe.py", "--audit", "--country", "SG"]), \
              contextlib.redirect_stdout(io.StringIO()) as output:
             code = stun.main()
-        self.assertEqual(code, 1)
-        self.assertTrue(output.getvalue().startswith("fail:"))
+        self.assertEqual(code, 0)
+        self.assertTrue(output.getvalue().startswith("ok:"))
+        self.assertIn("未验证", output.getvalue())
         self.assertNotIn(V4, output.getvalue())
 
 

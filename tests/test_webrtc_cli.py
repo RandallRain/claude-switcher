@@ -112,8 +112,8 @@ exit 0
                 self.assertNotIn("WebRTC ✗", result.stdout)
         self.assertFalse(self.events.exists(), "valid egress caused an unnecessary proxy restart")
 
-    def test_unknown_udp_outcome_is_not_accepted_by_any_command(self):
-        self.audit.write_text("fail:STUN均无有效响应，无法验证UDP出口\n")
+    def test_malformed_udp_outcome_is_not_accepted_by_any_command(self):
+        self.audit.write_text("fail:检测异常：STUN响应格式错误\n")
         check = self.run_cli("check")
         detail = self.run_cli("checkdetail")
         fix = self.run_cli("fix")
@@ -123,11 +123,17 @@ exit 0
         self.assertIn("WebRTC ✗", fix.stdout)
         self.assertNotIn("零暴露", check.stdout + detail.stdout + fix.stdout)
 
-    def test_partial_dual_stack_is_a_visible_warning_not_a_false_leak(self):
-        self.audit.write_text("warn:IPv4 UDP出口一致；IPv6 STUN无响应，未验证该路径\n")
+    def test_partial_dual_stack_is_green_with_a_visible_description(self):
+        self.audit.write_text("ok:仅见代理IP（IPv4）；IPv6未取得结果\n")
         self.assertEqual(self.run_cli("check").returncode, 0)
-        self.assertIn("WebRTC=warn:", self.run_cli("checkdetail").stdout)
-        self.assertIn("WebRTC ⚠", self.run_cli("fix").stdout)
+        self.assertIn("WebRTC=ok:仅见代理IP（IPv4）；IPv6未取得结果", self.run_cli("checkdetail").stdout)
+        self.assertIn("WebRTC ✓", self.run_cli("fix").stdout)
+
+    def test_no_stun_result_is_green_without_claiming_udp_is_blocked(self):
+        self.audit.write_text("ok:未发现非代理IP；STUN均无结果（UDP出口未验证）\n")
+        self.assertEqual(self.run_cli("check").returncode, 0)
+        self.assertIn("WebRTC=ok:未发现非代理IP", self.run_cli("checkdetail").stdout)
+        self.assertIn("WebRTC ✓", self.run_cli("fix").stdout)
 
     def test_old_probe_output_fails_closed_without_echoing_addresses(self):
         self.audit.write_text("RESULT:8.8.8.8\n")

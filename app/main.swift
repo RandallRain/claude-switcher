@@ -275,7 +275,7 @@ struct ContentView: View {
                             .foregroundColor(.white.opacity(0.65))
                         Text(row.name).font(.callout).foregroundColor(.white.opacity(0.9))
                         Spacer()
-                        if row.name != "出口 IP", !row.detail.isEmpty {
+                        if row.name != "出口 IP", row.name != "WebRTC", !row.detail.isEmpty {
                             Text(row.displayDetail).font(.caption)
                                 .foregroundColor(.white.opacity(0.6))
                                 .lineLimit(row.name == "时区" || row.name == "地区" ? 2 : 1)
@@ -291,6 +291,14 @@ struct ContentView: View {
                             .lineSpacing(3)
                             .fixedSize(horizontal: false, vertical: true)
                             .textSelection(.enabled)
+                    }
+                    if row.name == "WebRTC", !row.detail.isEmpty {
+                        Text(row.displayDetail)
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.7))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .help(row.detail)
                     }
                 }
                 .padding(.vertical, 7).padding(.horizontal, 12)
