@@ -1,6 +1,6 @@
 <div align="center">
 
-# Claude 切换器
+# Claude 切换器-fork
 
 **Fail-Closed 账号环境管理器 —— 把真实 IP 泄漏拦截在启动之前**
 
@@ -18,6 +18,27 @@
 </div>
 
 ---
+
+## 个人版与上游版共存
+
+本分支为个人版,桌面名称为 **Claude切换器-fork**,App 标识为 `local.claude-switcher-fork`。原项目见 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)。
+
+| 项目 | 上游版 | fork 版 |
+|---|---|---|
+| 核心 | `~/.local/bin/claude-switch.sh` | `~/.local/bin/claude-switch-fork.sh` |
+| 状态、账号库、探针、缓存 | `~/.claude-switcher/` | `~/.claude-switcher-fork/` |
+| Claude 活动数据 | `~/Library/Application Support/Claude/` | `~/Library/Application Support/Claude-fork/` |
+| root 守护脚本 | `/Library/Application Support/claude-switcher/` | `/Library/Application Support/claude-switcher-fork/` |
+| 后台 Label | `local.claude-bodyguard` / `local.tz-watchdog` / `local.claude-update` | 对应名称均添加 `-fork` |
+| 更新源 | `YOURSJEYO/claude-switcher:main` | `RandallRain/claude-switcher:main-fork` |
+
+fork 版通过 `open -na /Applications/Claude.app --args --user-data-dir=.../Claude-fork` 使用独立 Claude 数据目录。首次使用需要重新登录,不会复制或迁移原版的账号/凭据。切换和保镖关闭进程时按专用目录识别 fork Claude,不向所有 Claude 实例发送退出命令。两版仍使用同一个系统安装的 Claude 二进制和 macOS 用户 Keychain,这不是操作系统安全沙箱;Claude 更新后须重新验证独立目录兼容性。
+
+两个切换器请依次使用。时区、用户 Locale、IPv6、DNS 和同一个代理客户端/TUN 属于共享系统资源,不能靠两个 App 名称隔离。fork 的修复/地区切换/规则写入在原版 Claude 或原版切换器活跃时会中止;时区看门狗只在 fork 活跃时工作,检测到原版目标冲突时不改系统时区。原版自身的关闭/修复逻辑可能影响其他 Claude 实例,完整隔离需独立 macOS 虚拟机。
+
+Clash 规则使用独立 `claude-switcher-fork` 标记,保留已有原版和用户脚本;实际路由仍影响共享代理的流量。安装/卸载 fork 不移除原版程序、服务或账号,也不自动撤销系统网络设置。
+
+自动更新每 12 小时由用户态 `local.claude-update-fork` 运行,日志写入 `~/.claude-switcher-fork/update.log`。校验工件并验证 fork 更新源标记后才覆盖个人版,保留五项本机配置;自检失败整组回滚。root 守护脚本与桌面 UI 有变化时需重新运行个人版安装器。仅更新脚本不会重编译 UI。
 
 ## 为什么做这个
 
@@ -108,7 +129,7 @@ WebRTC 颜色按是否观测到非代理 IP 判定，IPv4、IPv6 分别比较：
 
 ```bash
 # 克隆后双击 installer/安装.command 即可,自动识别代理客户端、代理组名与地区目标
-git clone https://github.com/YOURSJEYO/claude-switcher.git
+git clone --branch main-fork https://github.com/RandallRain/claude-switcher.git
 ```
 
 ## 地区自适应
@@ -116,7 +137,7 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 不再锁死美国：安装程序按当前出口 IP 的国家自动锁定**目标国家 + 时区 + 地区格式**三件套（出口是 CN 会直接拒装，逼你先挂好代理）。之后换了其他国家的节点，不用重装，一条命令重新适配：
 
 ```bash
-~/.local/bin/claude-switch.sh set-region
+~/.local/bin/claude-switch-fork.sh set-region
 # 自动探测出口国家 → 改写自身配置 → 设地区格式 → 弹一次授权锁时区 → 同步看门狗
 # 输出: OK:region=JP tz=Asia/Tokyo locale=ja_JP
 ```
@@ -129,10 +150,10 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 ## 使用
 
-1. 双击桌面「Claude切换器」→ 等待 14 项检查
+1. 双击桌面「Claude切换器-fork」→ 等待 14 项检查
 2. 全绿 → 选账号启动；有红项 → 「一键修复」自动处理
 3. B 账号首次使用登录一次，以后 A/B 随切随用、互不干扰
-4. 换了其他国家的节点 → 跑一次 `~/.local/bin/claude-switch.sh set-region`，国家/时区/地区格式一键重新锁定
+4. 换了其他国家的节点 → 跑一次 `~/.local/bin/claude-switch-fork.sh set-region`，国家/时区/地区格式一键重新锁定
 
 ## Web 版环境检测（零安装）
 
@@ -154,7 +175,7 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 14 项审计之外，提供一层按需的深挖体检，点 App 右上角心电图标或运行：
 
 ```bash
-~/.local/bin/claude-switch.sh fingerprint
+~/.local/bin/claude-switch-fork.sh fingerprint
 ```
 
 输出四类信息：
@@ -173,7 +194,7 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 ```bash
 bash core/claude-switch.sh diagnose-proxy --proxy http://127.0.0.1:18080
 # 已安装版本:
-~/.local/bin/claude-switch.sh diagnose-proxy --config /path/to/private-proxy.json
+~/.local/bin/claude-switch-fork.sh diagnose-proxy --config /path/to/private-proxy.json
 ```
 
 私有配置文件只需包含 `{"proxy_url":"http://127.0.0.1:18080"}`。也可明确设置 `CLAUDE_SWITCHER_PROXY_URL`；命令行/配置文件优先于该变量。需要代理认证时优先使用私有配置或变量，避免凭据出现在本命令的参数中。支持 `http`、`https`、`socks5`、`socks5h`，地址必须包含端口；不会自动扫描代理或回退直连。

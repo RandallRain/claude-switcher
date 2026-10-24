@@ -5,6 +5,16 @@
 
 ---
 
+## 本分支的 macOS fork 身份
+
+本分支个人版 App 名称为 `Claude切换器-fork.app`,核心安装为 `~/.local/bin/claude-switch-fork.sh`,运行状态/账号库为 `~/.claude-switcher-fork/`,活动 Claude 数据为 `~/Library/Application Support/Claude-fork/`。必须通过 `open -na /Applications/Claude.app --args --user-data-dir=.../Claude-fork` 启动个人版 Claude,不可回退到原版默认数据目录。
+
+三个服务的安装 Label 和 plist 文件名分别为 `local.claude-bodyguard-fork`、`local.tz-watchdog-fork`、`local.claude-update-fork`;仓库中的三个 plist 模板仍保留原文件名。root 守护脚本只安装于 `/Library/Application Support/claude-switcher-fork/`,脚本必须为 root:wheel、755。更新源固定为 `RandallRain/claude-switcher` 的 `main-fork`,绝不能从上游 main 覆盖个人版。
+
+两版账号库和 current 独立,不得读取/迁移/改写原版 `~/.claude-switcher/accounts/` 的存档结构。原版脚本/App/服务也不得由个人版安装器或卸载器覆盖。首次个人版账号应独立登录,不要复制原版凭据。保镖/账号切换仅关闭带个人版专用 user-data-dir 的 Claude 实例。
+
+macOS 时区、Locale、IPv6、代理 TUN 和系统 Keychain 无法按 App 名称隔离。不得宣称完全隔离;修改共享设置时必须检查原版活跃状态和看门狗目标冲突。fork 看门狗只在 fork 活跃时工作。完整隔离需独立操作系统。
+
 ## 你的任务
 
 帮助用户在 macOS 上安装并配置「Claude 切换器」：一个带环境安检的 Claude 账号启动/切换工具。目标状态是：**用户双击桌面图标，14 项安全检查全部通过，可以正常启动 Claude**。
@@ -23,25 +33,25 @@
 
 首选引导用户运行安装器（双击 `installer/安装.command`，或终端执行它）。如果安装器环境受限，按下面的手动等效步骤执行：
 
-1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行），把 `core/stun-probe.py`、`core/clash-rules.py`、`core/clash-global-rules.js` 放到 `~/.claude-switcher/`
+1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch-fork.sh`（可执行），把 `core/stun-probe.py`、`core/clash-rules.py`、`core/clash-global-rules.js` 放到 `~/.claude-switcher-fork/`
 2. 探测代理客户端并写进脚本顶部 `PROXY_MODE="..."`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/shadowrocket/sing-box/clashx/surge/auto 中选择
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名写进 `PROXY_GROUP="..."`（其他客户端跳过）
 4. 按出口 IP 自动锁定地区目标：`curl -s ipinfo.io/json` 的 country → `COUNTRY_TARGET`，timezone → `TZ_TARGET`，country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ `LOCALE_TARGET`，三项都写进脚本头部
-5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` 替换为实际值），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
+5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` / `__USER_UID__` 替换为实际值），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher-fork/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon (安装名称添加 `-fork`) 安装到 `/Library/LaunchDaemons/`（ProgramArguments 已指向个人版系统目录;复制时 plist 文件名也必须加 `-fork`）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 以 `local.claude-update-fork.plist` 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto` (来源 `RandallRain/claude-switcher:main-fork`)）
 6. 现场编译界面 App（需要 Xcode 命令行工具，必须带 `-target` 否则新 SDK 产物在老系统拒启动）：
    ```bash
-   swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o Claude切换器.app/Contents/MacOS/ClaudeSwitcher -framework SwiftUI -framework AppKit
+   swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o Claude切换器-fork.app/Contents/MacOS/ClaudeSwitcher-fork -framework SwiftUI -framework AppKit
    ```
    图标用 `assets/icon-2048.png` 经 sips 生成 iconset 再 `iconutil -c icns` 打进 `Contents/Resources/AppIcon.icns`，`Info.plist` 声明 `CFBundleIconFile`，最后 `codesign --force --deep -s -`
-7. Clash Verge 模式运行 `claude-switch.sh write-global-rules`，将规则写入「全局扩展脚本」(Global Extend Script / `profiles/Script.js`) 并重载。保留用户原 `main`，按订阅选择代理组；三条 STUN 端口代理规则后有 `REJECT` 后备，并包含双栈参考出口路由。不要再往全局 Merge 写 `prepend-rules`。其他客户端提示用户自行添加域名、STUN 端口及参考出口规则
+7. Clash Verge 模式运行 `claude-switch-fork.sh write-global-rules`，将规则写入「全局扩展脚本」(Global Extend Script / `profiles/Script.js`) 并重载。保留用户原 `main`，按订阅选择代理组；三条 STUN 端口代理规则后有 `REJECT` 后备，并包含双栈参考出口路由。不要再往全局 Merge 写 `prepend-rules`。其他客户端提示用户自行添加域名、STUN 端口及参考出口规则
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
-9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
+9. 收尾自检：运行 `~/.local/bin/claude-switch-fork.sh checkdetail` 确认各项状态
 
 macOS 的 `check`、`checkdetail` 和 `fix` 共用一轮双栈出口/STUN 快照。出口 IP 在 UI 分别显示 IPv4、IPv6 及国家，单个地址族未获取会明确标注；任一观测出口国家异常或全部未获取均失败。时区、地区项显示实际系统时区与 Locale（包含地区名称），不是仅显示目标值。真实地址只用于本机 UI/私有缓存，不要复制到日志或交接输出。
 
 WebRTC 按是否观测到非代理 IP 判色：同版本匹配、部分或全部探针无结果均为绿色，UI 必须说明已匹配的地址族及未取得结果的范围；全部无结果要注明 UDP 出口未验证，不得写成已确认“UDP 不出网、零暴露”。地址不匹配、响应格式异常、探针执行异常、有效地址缺少同版本参考或代理策略无法核验仍为红色。
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行并连同辅助工件比对去重 → 备份核心与探针/全局规则工件 → 注入配置并同步辅助文件 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 整组回滚）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher-fork/update.log`；手动跑则直接打印。流程：拉取个人仓库 main-fork → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行并连同辅助工件比对去重 → 备份核心与探针/全局规则工件 → 注入配置并同步辅助文件 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 整组回滚）
 
 ## 独立代理诊断
 
@@ -51,10 +61,10 @@ WebRTC 按是否观测到非代理 IP 判色：同版本匹配、部分或全部
 
 ## 验收标准（全部满足才算装完）
 
-- 终端执行 `~/.local/bin/claude-switch.sh checkdetail` 输出 14 行且全部 `=ok`
+- 终端执行 `~/.local/bin/claude-switch-fork.sh checkdetail` 输出 14 行且全部 `=ok`
 - 双击桌面 App，界面全绿，能正常启动 Claude
-- `launchctl print system/local.claude-bodyguard`、`system/local.tz-watchdog` 与 `gui/$(id -u)/local.claude-update` 均能查到（服务已注册）
-- `/Library/Application Support/claude-switcher/` 下两个守护脚本属 root:wheel、权限 755，当前用户不可写
+- `launchctl print system/local.claude-bodyguard-fork`、`system/local.tz-watchdog-fork` 与 `gui/$(id -u)/local.claude-update-fork` 均能查到（服务已注册）
+- `/Library/Application Support/claude-switcher-fork/` 下两个守护脚本属 root:wheel、权限 755，当前用户不可写
 - 切换一次账号 B 再切回 A，A 的登录态完好
 
 ## 排障手册（以下全是实战中踩过的坑，按症状直接查）
@@ -64,7 +74,7 @@ WebRTC 按是否观测到非代理 IP 判色：同版本匹配、部分或全部
 | TUN 网卡消失、出口变回国内 | **Clash Verge 更新/异常重启会把 `enable_tun_mode` 重置为 false**（生产环境已发生 4 次） | 退出 App → 改 `verge.yaml` 为 true → 重启 App。切换器的一键修复已内置此逻辑 |
 | 时区总是自己变回去 | macOS 自动时区或未知程序改动（生产环境已抓 8 次） | 看门狗会自动回滚；查 `~/Library/Logs/tz-watchdog.log` 留痕 |
 | 检查结果显示 0/11、数据为空 | 中文日志被 `cut -c` 按字节截断产生非法 UTF-8，Swift 严格解码整体失败 | 脚本必须 `export LC_ALL=en_US.UTF-8`；界面端用容错解码 `String(decoding:as:)` |
-| 修改 App 后界面没变化 | 旧进程没死：App 关窗不退 + `pkill` 匹配中文路径会因 Unicode NFD 编码失配而静默失败 | 用 `pkill -x ClaudeSwitcher`（按进程名）；App 必须实现 `applicationShouldTerminateAfterLastWindowClosed` |
+| 修改 App 后界面没变化 | 旧进程没死：App 关窗不退 + `pkill` 匹配中文路径会因 Unicode NFD 编码失配而静默失败 | 用 `pkill -x ClaudeSwitcher-fork`（按进程名）；App 必须实现 `applicationShouldTerminateAfterLastWindowClosed` |
 | headless Chrome 做 WebRTC 检测无结果 | headless 模式 ICE 子系统不产出候选 | 不要走浏览器路线，用本项目的纯 Python STUN 探针 |
 | 代理节点报错但流量没泄漏 | 节点被重置时隧道内请求失败≠泄漏；Fail-Closed 下流量只断不绕 | 换线路即可 |
 | WebRTC 检测失败但 TUN 正常 | 国内 STUN 域名可能命中 DIRECT，或同版本参考不可达/出口分流 | 运行 `fix`，通过 Global Extend Script 添加三端口代理及阻断后备规则，并核验实际内核；勿使用旧 Merge prepend-rules。IPv4/IPv6 分别比较。无结果显示绿色“未发现非代理 IP”，同时注明未验证；格式/执行异常仍为红色 |
@@ -73,11 +83,11 @@ WebRTC 按是否观测到非代理 IP 判色：同版本匹配、部分或全部
 ## 安全红线（Agent 必须遵守）
 
 1. **绝不在出口国家与目标不一致时启动 Claude**——任何时候先验 cloudflare trace 的 `loc` 与脚本头部 `COUNTRY_TARGET` 一致；换了国家节点先跑 `claude-switch.sh set-region` 再启动
-2. 切换账号前必须先完全退出 Claude 进程，再交换数据目录
+2. 切换账号前必须先完全退出 fork Claude 进程，再交换数据目录
 3. 不要在日志、文档、Issue 里暴露用户的住宅/代理 IP 与任何凭据
-4. 不要改动 `~/.claude-switcher/accounts/` 下的存档结构
+4. 不要改动 `~/.claude-switcher-fork/accounts/` 下的存档结构
 5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——自动更新靠它校验工件完整性，清单与代码不一致会导致所有用户更新失败
-6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher/` 下的保镖/看门狗属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器
+6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher-fork/` 下的保镖/看门狗属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器
 
 ## Windows 版（windows/ 目录, Beta）
 
@@ -124,9 +134,9 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 
 **除非维护者在当次对话中明确要求，否则不得更新/部署维护者本机的已安装版本。** 具体包括：
 
-- 不得覆盖 `~/.local/bin/claude-switch.sh`、`~/.local/bin/local.claude-*.plist`
-- 不得重新编译或替换桌面 App（`~/Desktop/Claude切换器.app`）
-- 不得改动 `/Library/Application Support/claude-switcher/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
+- 不得覆盖 `~/.local/bin/claude-switch-fork.sh`、`~/.local/bin/local.claude-*.plist`
+- 不得重新编译或替换桌面 App（`~/Desktop/Claude切换器-fork.app`）
+- 不得改动 `/Library/Application Support/claude-switcher-fork/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
 - 不得触发本机 `update`、不得执行安装器/卸载器
 
 日常开发默认流程：**只修改仓库文件 → 验证（本地只跑不影响安装态的测试/静态检查）→ 提交推送**。需要真机验证时，先询问维护者是否允许在本机部署。

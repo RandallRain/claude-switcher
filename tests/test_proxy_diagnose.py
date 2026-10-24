@@ -62,7 +62,8 @@ esac
         result = subprocess.run(["/bin/bash", str(script), "diagnose-proxy", *args],
                                 env=self.env if env is None else env,
                                 capture_output=True, text=True, timeout=20)
-        self.assertFalse((self.home / ".claude-switcher").exists(), "diagnostic created account state")
+        self.assertFalse((self.home / ".claude-switcher").exists(), "diagnostic created upstream state")
+        self.assertFalse((self.home / ".claude-switcher-fork").exists(), "diagnostic created fork state")
         self.assertFalse((self.folder / "unexpected-system-call").exists(), "diagnostic touched system tools")
         return result, json.loads(result.stdout)
 
@@ -77,7 +78,7 @@ esac
         self.assertFalse(data["system_modified"])
 
     def test_installed_single_script_needs_no_extra_helpers(self):
-        installed = self.home / ".local/bin/claude-switch.sh"
+        installed = self.home / ".local/bin/claude-switch-fork.sh"
         installed.parent.mkdir(parents=True)
         shutil.copyfile(SCRIPT, installed)
         result, data = self.run_cli("--proxy", "http://127.0.0.1:18080", script=installed)
@@ -89,7 +90,7 @@ esac
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "current=none hasA=0 hasB=0")
-        self.assertTrue((self.home / ".claude-switcher/accounts").is_dir())
+        self.assertTrue((self.home / ".claude-switcher-fork/accounts").is_dir())
 
     def test_private_config_and_credentials_do_not_enter_output_or_argv(self):
         private = self.home / "private-proxy.json"

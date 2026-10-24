@@ -13,5 +13,6 @@ shasum -a 256 \
     daemons/local.tz-watchdog.plist \
     daemons/local.claude-update.plist \
     installer/安装.command \
-    installer/卸载.command > SHA256SUMS
+    installer/卸载.command \
+    scripts/build-macos-app.sh > SHA256SUMS
 echo "✓ SHA256SUMS 已更新"

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Claude 账号切换器 - 核心脚本 (通用版)
-# 用法: claude-switch.sh check | status | switch A|B | checkdetail | fix | set-region | update [--auto] | diagnose-proxy
+# Claude 账号切换器-fork - 核心脚本
+# 用法: claude-switch-fork.sh check | status | switch A|B | checkdetail | fix | set-region | update [--auto] | diagnose-proxy
 set -u
 export LC_ALL=en_US.UTF-8
 # 检测输出含用于本机 UI 的地址,缓存和历史记录只允许当前用户读取。
@@ -150,14 +150,63 @@ TZ_TARGET="America/New_York"   # 锁定时区,应与出口IP所在城市一致
 LOCALE_TARGET="en_US"          # 锁定地区格式
 # ============================================================
 
-DATA="$HOME/Library/Application Support/Claude"
-BASE="$HOME/.claude-switcher"
-LOG="$HOME/Library/Logs/claude-switch.log"
+EDITION="fork"
+UPDATE_REPO="RandallRain/claude-switcher"
+UPDATE_BRANCH="main-fork"
+DATA="$HOME/Library/Application Support/Claude-fork"
+# 个人版的活动数据、账号存档、探针、缓存和更新均独立。
+BASE="$HOME/.claude-switcher-fork"
+STATE_BASE="$BASE"
+LOG="$HOME/Library/Logs/claude-switch-fork.log"
 CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 ROUTE_MISSED=""
 HELPER_DIR="$BASE"
 [ -f "$(dirname "$0")/stun-probe.py" ] && HELPER_DIR="$(cd "$(dirname "$0")" && pwd)"
-mkdir -p "$BASE/accounts"
+mkdir -p "$STATE_BASE/accounts" "$BASE" "$HOME/Library/Logs"
+
+# fork 内部串行修改;原版 CLI 不识别此锁,系统设置另做冲突检查。
+acquire_operation_lock() {
+    OP_LOCK="$BASE/operation.lock"
+    if ! mkdir "$OP_LOCK" 2>/dev/null; then
+        echo "FAIL:fork 版另一个操作正在执行;如上次异常退出,确认无操作后删除 $OP_LOCK"
+        return 1
+    fi
+    trap 'rmdir "$OP_LOCK" 2>/dev/null' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+# fork 包含带专用目录的辅助进程,保证交换数据前完全退出;原版只识别主进程。
+claude_pids() {
+    ps -ww -U "$(id -u)" -o pid=,command= | awk -v app='/Applications/Claude.app/Contents/MacOS/Claude' \
+        -v root='/Applications/Claude.app/Contents/' \
+        -v flag="--user-data-dir=$DATA" -v edition="${1:-fork}" '
+        {pid=$1; sub(/^[ \t]*[0-9]+[ \t]+/, "")}
+        index($0,root)==1 {
+            pos=index($0,flag); nextchar=substr($0,pos+length(flag),1)
+            own=pos>0 && (nextchar=="" || nextchar==" ")
+            if ((edition=="fork" && own) || (edition=="upstream" && !own && index($0,app)==1 && index($0,"--type=")==0)) print pid
+        }'
+}
+
+require_exclusive_system() {
+    if [ -n "$(claude_pids upstream)" ] || pgrep -x ClaudeSwitcher >/dev/null 2>&1; then
+        echo "FAIL:系统设置为 macOS 共用,请先退出原版切换器及原版 Claude"
+        return 1
+    fi
+}
+
+region_compatible() {
+    local other='/Library/Application Support/claude-switcher/tz-watchdog.sh' value=""
+    if launchctl print system/local.tz-watchdog >/dev/null 2>&1 && [ -f "$other" ]; then
+        value=$(sed -n 's/^TARGET=//p' "$other" | head -1)
+        value=${value#\"}; value=${value%\"}
+        if [ -n "$value" ] && [ "$value" != "$1" ]; then
+            echo "FAIL:原版看门狗目标为 $value,与 fork 的 $1 冲突;请先统一目标或停用原版看门狗"
+            return 1
+        fi
+    fi
+}
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$LOG"; }
 
@@ -301,7 +350,7 @@ check() {
         *) fails="$fails;WebRTC检测异常(请更新探针)" ;;
     esac
 
-    launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || fails="$fails;保镖未运行"
+    launchctl print system/local.claude-bodyguard-fork >/dev/null 2>&1 || fails="$fails;保镖未运行"
 
     # 兼容升级前的规则;WebRTC 仍须核验实际 UDP 代理策略,全局脚本未核验时界面提示修复。
     if [ "$PROXY_MODE" = "clash-verge" ]; then
@@ -408,8 +457,8 @@ checkdetail() {
         ok:*|warn:*|fail:*) echo "WebRTC=$wr" ;;
         *) echo 'WebRTC=fail:检测异常(请更新探针)' ;;
     esac
-    if launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
-        lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
+    if launchctl print system/local.claude-bodyguard-fork >/dev/null 2>&1; then
+        lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard-fork.log" 2>/dev/null | cut -c1-40)
         echo "保镖=ok:${lastkill:-待命}"
     else
         echo '保镖=fail:未安装'
@@ -471,6 +520,7 @@ write_global_rules() {
 # 一键修复:按项自动修复,每步输出结果
 fix() {
     echo "FIX:开始一键修复"
+    region_compatible "$TZ_TARGET" || return 1
     # 修复会重载代理;先完全退出 Claude,避免重载期间重新直连。
     quit_claude || { echo "FIX:Claude 未能完全退出,修复已中止"; return 1; }
     fix_failed=0
@@ -529,8 +579,9 @@ fix() {
     adminCmds=""
     [ "$tz" != "$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
     echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
-    if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
-        adminCmds="${adminCmds}cp $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ && chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist && launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist; "
+    if ! launchctl print system/local.claude-bodyguard-fork >/dev/null 2>&1; then
+        # 系统守护脚本由安装器以 root 所有权安装,日常修复只重新注册现有系统 plist。
+        adminCmds="${adminCmds}launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard-fork.plist; "
     fi
     if [ -n "$adminCmds" ]; then
         adminCmds="${adminCmds}dscacheutil -flushcache; killall -HUP mDNSResponder"
@@ -625,6 +676,7 @@ set_region() {
     if [ "$loc" != "$ctry" ]; then
         echo "FAIL:出口国家不一致(cloudflare=$loc ipinfo=$ctry),已中止"; return 1
     fi
+    region_compatible "$ntz" || return 1
     nlocale=$(locale_for "$ctry")
 
     # 改写脚本自身头部三个配置项
@@ -639,7 +691,7 @@ set_region() {
     defaults write -g AppleLocale "$nlocale"
 
     # 时区(需管理员权限,会弹一次授权框);看门狗脚本在 root 目录下,顺道用同一次授权同步目标值
-    WD="/Library/Application Support/claude-switcher/tz-watchdog.sh"
+    WD="/Library/Application Support/claude-switcher-fork/tz-watchdog.sh"
     adminCmds="/usr/sbin/systemsetup -settimezone $ntz"
     wdsync=0
     if [ -f "$WD" ] && [ ! -w "$WD" ]; then
@@ -661,13 +713,17 @@ ASEOF
     echo "OK:region=$loc tz=$ntz locale=$nlocale"
 }
 
-# 自动更新:拉取 main 分支最新代码,SHA256 校验+配置注入+自检+失败回滚(--auto 供 LaunchAgent 每12小时调用)
+# 自动更新:只跟踪个人仓库 main-fork,不写入原版程序/辅助文件。
 self_update() {
     if [ "${1:-}" = "--auto" ]; then auto=1; else auto=0; fi
     # 路径全部从脚本自身位置推导,兼容旧版 LaunchDaemon(root) 混跑时 $HOME 不可靠的场景
     BIN=$(cd "$(dirname "$0")" && pwd)
     UHOME="${BIN%/.local/bin}"
     [ "$UHOME" = "$BIN" ] && UHOME="$HOME"
+    if [ "$BIN" != "$UHOME/.local/bin" ] || [ "$(basename "$0")" != claude-switch-fork.sh ]; then
+        echo "FAIL:请通过 ~/.local/bin/claude-switch-fork.sh update 更新已安装的 fork 版"
+        return 1
+    fi
     if [ "$auto" -eq 1 ]; then
         mkdir -p "$BASE"
         exec >>"$BASE/update.log" 2>&1
@@ -675,23 +731,24 @@ self_update() {
     fi
 
     tmpd=$(mktemp -d)
-    if ! curl -sL --max-time 30 "https://codeload.github.com/YOURSJEYO/claude-switcher/zip/refs/heads/main" -o "$tmpd/main.zip" \
+    if ! curl -fsSL --max-time 30 "https://codeload.github.com/$UPDATE_REPO/zip/refs/heads/$UPDATE_BRANCH" -o "$tmpd/main.zip" \
         || ! unzip -q "$tmpd/main.zip" -d "$tmpd" 2>/dev/null; then
         echo "FAIL:下载或解压失败(网络问题,稍后再试)"; rm -rf "$tmpd"; return 1
     fi
-    NEW="$tmpd/claude-switcher-main"
+    NEW="$tmpd/claude-switcher-$UPDATE_BRANCH"
     if [ ! -f "$NEW/core/claude-switch.sh" ]; then
         echo "FAIL:远程包结构异常,已中止"; rm -rf "$tmpd"; return 1
     fi
 
     # 工件完整性校验:逐项比对仓库 SHA256SUMS,任一不符即中止(防传输篡改;信任根为 GitHub 仓库本身)
-    if ! curl -sL --max-time 15 "https://raw.githubusercontent.com/YOURSJEYO/claude-switcher/main/SHA256SUMS" -o "$tmpd/SHA256SUMS" \
+    if ! curl -fsSL --max-time 15 "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/SHA256SUMS" -o "$tmpd/SHA256SUMS" \
         || [ ! -s "$tmpd/SHA256SUMS" ]; then
         echo "FAIL:无法获取校验清单(SHA256SUMS),已中止"; rm -rf "$tmpd"; return 1
     fi
     bad=0
     while read -r sum rel; do
         [ -z "$sum" ] && continue
+        case "$rel" in /*|../*|*/../*|*/..) bad=1; break;; esac
         if [ ! -f "$NEW/$rel" ] || [ "$(shasum -a 256 "$NEW/$rel" | awk '{print $1}')" != "$sum" ]; then
             bad=1; break
         fi
@@ -700,20 +757,33 @@ self_update() {
         echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
     fi
 
+    # 四个实际部署工件必须全部列入清单;拒绝误发布的原版或旧版包。
+    for artifact in core/claude-switch.sh core/stun-probe.py core/clash-rules.py core/clash-global-rules.js; do
+        if ! awk -v path="$artifact" '$2 == path && length($1) == 64 {found=1} END {exit !found}' "$tmpd/SHA256SUMS"; then
+            echo "FAIL:校验清单缺少必要工件,已中止"; rm -rf "$tmpd"; return 1
+        fi
+    done
+    if ! grep -qx 'EDITION="fork"' "$NEW/core/claude-switch.sh" || \
+       ! grep -qx 'UPDATE_REPO="RandallRain/claude-switcher"' "$NEW/core/claude-switch.sh" || \
+       ! grep -qx 'UPDATE_BRANCH="main-fork"' "$NEW/core/claude-switch.sh"; then
+        echo "FAIL:更新包不是 fork/main-fork 版本,已中止"; rm -rf "$tmpd"; return 1
+    fi
+
     # 跳过判断同时比较辅助工件;探针/全局脚本单独更新也必须分发。
     strip_cfg() { grep -vE '^(PROXY_MODE|PROXY_GROUP|COUNTRY_TARGET|TZ_TARGET|LOCALE_TARGET)="' "$1"; }
-    UPDATE_BASE="$UHOME/.claude-switcher"
+    UPDATE_BASE="$UHOME/.claude-switcher-fork"
+    CORE_PATH="$BIN/claude-switch-fork.sh"
     helpers_changed=0
     for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
         cmp -s "$UPDATE_BASE/$helper" "$NEW/core/$helper" || helpers_changed=1
     done
-    if [ "$helpers_changed" -eq 0 ] && [ -f "$BIN/claude-switch.sh" ] && \
-       diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
+    if [ "$helpers_changed" -eq 0 ] && [ -f "$CORE_PATH" ] && \
+       diff <(strip_cfg "$CORE_PATH") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
         echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
     fi
 
     # 备份现有核心脚本
-    if [ -f "$BIN/claude-switch.sh" ] && ! cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"; then
+    if [ -f "$CORE_PATH" ] && ! cp "$CORE_PATH" "$CORE_PATH.bak"; then
         echo "FAIL:核心脚本备份失败,未执行更新"; rm -rf "$tmpd"; return 1
     fi
     mkdir -p "$UPDATE_BASE" "$tmpd/helper-backups"
@@ -743,29 +813,34 @@ self_update() {
     fi
 
     # 替换核心脚本 + 从 .bak 读出5个配置值注入新脚本
-    if ! cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"; then
-        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+    if ! cp "$NEW/core/claude-switch.sh" "$CORE_PATH"; then
+        [ -f "$CORE_PATH.bak" ] && cp "$CORE_PATH.bak" "$CORE_PATH"
         restore_update_helpers
         echo "FAIL:核心脚本更新失败,已回滚"; rm -rf "$tmpd"; return 1
     fi
     PM=""; PG=""; CT=""; TZV=""; LCT=""
-    if [ -f "$BIN/claude-switch.sh.bak" ]; then
-        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh.bak" | head -1 | cut -d'"' -f2; }
+    if [ -f "$CORE_PATH.bak" ]; then
+        get_cfg() { grep "^$1=\"" "$CORE_PATH.bak" | head -1 | cut -d'"' -f2; }
         PM=$(get_cfg PROXY_MODE); PG=$(get_cfg PROXY_GROUP); CT=$(get_cfg COUNTRY_TARGET)
         TZV=$(get_cfg TZ_TARGET); LCT=$(get_cfg LOCALE_TARGET)
-        inject_cfg() { grep -q "^$1=\"" "$BIN/claude-switch.sh.bak" && sed -i '' "s|^$1=\".*\"|$1=\"$2\"|" "$BIN/claude-switch.sh"; }
+        inject_cfg() {
+            local value="$2"
+            value=${value//\\/\\\\}; value=${value//&/\\&}; value=${value//|/\\|}
+            grep -q "^$1=\"" "$CORE_PATH.bak" && sed -i '' "s|^$1=\".*\"|$1=\"$value\"|" "$CORE_PATH"
+        }
         inject_cfg PROXY_MODE "$PM"; inject_cfg PROXY_GROUP "$PG"; inject_cfg COUNTRY_TARGET "$CT"
         inject_cfg TZ_TARGET "$TZV"; inject_cfg LOCALE_TARGET "$LCT"
     fi
-    chmod +x "$BIN/claude-switch.sh"
+    chmod +x "$CORE_PATH"
 
     # 守护进程脚本(root 所有,用户态不可写):与远程模板比对,有差异只提示不自动改
-    APPDIR="/Library/Application Support/claude-switcher"
+    APPDIR="/Library/Application Support/claude-switcher-fork"
     if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
         [ -z "$PM" ] && PM="clash-verge"
         [ -z "$TZV" ] && TZV="America/New_York"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__PROXY_MODE__|$PM|g" "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
+        user_uid=$(stat -f '%u' "$UHOME")
+        sed -e "s|__HOME__|$UHOME|g" -e "s|__USER_UID__|$user_uid|g" -e "s|__PROXY_MODE__|$PM|g" "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
+        sed -e "s|__HOME__|$UHOME|g" -e "s|__USER_UID__|$user_uid|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
         if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
            ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then
             echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
@@ -774,12 +849,13 @@ self_update() {
     # 更新后自检:root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
     if [ "$(id -u)" -eq 0 ]; then
         owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
-        if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail 2>&1); else out=""; fi
+        if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$CORE_PATH" checkdetail 2>&1); else out=""; fi
     else
-        out=$("$BIN/claude-switch.sh" checkdetail 2>&1)
+        out=$("$CORE_PATH" checkdetail 2>&1)
     fi
-    if [ -z "$out" ] || echo "$out" | grep -q '=fail'; then
-        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+    count=$(echo "$out" | grep -Ec '^[^#=]+=(ok|warn|fail)(:|$)')
+    if [ "$count" -ne 14 ] || echo "$out" | grep -q '=fail'; then
+        [ -f "$CORE_PATH.bak" ] && cp "$CORE_PATH.bak" "$CORE_PATH"
         restore_update_helpers
         rm -rf "$tmpd"
         echo "FAIL:新版自检未通过,已自动回滚"
@@ -827,33 +903,79 @@ fingerprint() {
 }
 
 status() {
-    cur="none"; [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
-    hasA=0; [ -d "$BASE/accounts/A" ] && hasA=1
-    hasB=0; [ -d "$BASE/accounts/B" ] && hasB=1
+    cur="none"; [ -f "$STATE_BASE/current" ] && cur=$(cat "$STATE_BASE/current")
+    hasA=0; [ -d "$STATE_BASE/accounts/A" ] && hasA=1
+    hasB=0; [ -d "$STATE_BASE/accounts/B" ] && hasB=1
     echo "current=$cur hasA=$hasA hasB=$hasB"
 }
 
 quit_claude() {
-    pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || return 0
-    osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1
+    local pids
+    pids=$(claude_pids)
+    [ -n "$pids" ] || return 0
+    # 按进程 ID 关闭本版实例;不向共享 bundle ID 发送会影响原版的 quit。
+    for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
     for i in $(seq 1 15); do
-        pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || return 0
+        [ -n "$(claude_pids)" ] || return 0
         sleep 1
     done
     return 1
 }
 
+launch_claude() {
+    open -na /Applications/Claude.app --args "--user-data-dir=$DATA"
+}
+
 archive_current() {
-    cur="$1"
+    local cur="$1"
+    local t0 staged current previous moved=0 had_old=0
     t0=$(date +%s)
-    # 归档=把当前数据目录整体移走(同卷瞬时,跨卷 mv 自动退化为复制),不再全量深拷贝
-    rm -rf "$BASE/accounts/$cur.new"
-    if mv "$DATA" "$BASE/accounts/$cur.new" 2>/dev/null; then
-        rm -rf "$BASE/accounts/$cur"
-        mv "$BASE/accounts/$cur.new" "$BASE/accounts/$cur"
+    staged="$STATE_BASE/accounts/$cur.new"
+    current="$STATE_BASE/accounts/$cur"
+    previous="$STATE_BASE/accounts/$cur.previous"
+
+    # An interrupted archive may be the only remaining copy. Never clear it
+    # automatically, or delete the previous snapshot before the new one commits.
+    if [ -e "$staged" ] || [ -L "$staged" ] || [ -e "$previous" ] || [ -L "$previous" ]; then
+        log "FAIL:账号$cur 存在待恢复快照，拒绝覆盖"
+        return 1
+    fi
+    if mv "$DATA" "$staged" 2>/dev/null; then
+        moved=1
     else
-        rm -rf "$BASE/accounts/$cur.tmp"
-        copy_tree "$DATA" "$BASE/accounts/$cur.tmp" && rm -rf "$BASE/accounts/$cur" && mv "$BASE/accounts/$cur.tmp" "$BASE/accounts/$cur"
+        # A cross-volume move may leave a partial destination on failure.
+        if [ -e "$staged" ] || [ -L "$staged" ]; then
+            log "FAIL:账号$cur 归档移动不完整，保留现场"
+            return 1
+        fi
+        if ! copy_tree "$DATA" "$staged"; then
+            log "FAIL:账号$cur 归档复制失败，保留现场"
+            return 1
+        fi
+    fi
+
+    if [ -e "$current" ] || [ -L "$current" ]; then
+        if ! mv "$current" "$previous"; then
+            if [ "$moved" -eq 1 ]; then
+                mv "$staged" "$DATA" || log "WARN:账号$cur 数据保留在暂存位置"
+            fi
+            log "FAIL:账号$cur 旧快照无法安全转存"
+            return 1
+        fi
+        had_old=1
+    fi
+    if ! mv "$staged" "$current"; then
+        if [ "$had_old" -eq 1 ]; then
+            mv "$previous" "$current" || log "WARN:账号$cur 旧快照保留在恢复位置"
+        fi
+        if [ "$moved" -eq 1 ]; then
+            mv "$staged" "$DATA" || log "WARN:账号$cur 当前数据保留在暂存位置"
+        fi
+        log "FAIL:账号$cur 归档提交失败"
+        return 1
+    fi
+    if [ "$had_old" -eq 1 ]; then
+        rm -rf "$previous" || log "WARN:账号$cur 旧快照副本需手动清理"
     fi
     log "已存档账号$cur ($(( $(date +%s) - t0 ))s)"
 }
@@ -870,46 +992,52 @@ copy_tree() {
 
 switch_to() {
     target="$1"
-    cur="none"; [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
+    case "$target" in A|B) ;; *) echo "FAIL:账号只能为 A 或 B"; return 1;; esac
+    check || { echo "FAIL:启动安检未通过,未切换账号"; return 1; }
+    cur="none"; [ -f "$STATE_BASE/current" ] && cur=$(cat "$STATE_BASE/current")
     just_archived=0
 
     # 首次运行:把当前登录中的状态收编为账号A
     if [ "$cur" = "none" ] && [ -d "$DATA" ] && [ -n "$(ls -A "$DATA" 2>/dev/null)" ]; then
         quit_claude || { echo "FAIL:Claude 未能退出，请手动退出后重试"; return 1; }
-        archive_current A
+        archive_current A || { echo "FAIL:首次账号归档失败,已停止切换"; return 1; }
         just_archived=1
-        cur="A"; echo "$cur" > "$BASE/current"
+        cur="A"; echo "$cur" > "$STATE_BASE/current"
         log "首次运行:当前登录状态已收编为账号A"
         echo "NOTE:已将当前登录收编为账号A"
     fi
 
     if [ "$cur" = "$target" ]; then
         # 归档是移动语义,首次收编后需把当前账号还原回 DATA
-        if [ "$just_archived" = "1" ] && [ ! -d "$DATA" ] && [ -d "$BASE/accounts/$target" ]; then
-            copy_tree "$BASE/accounts/$target" "$DATA"
+        if [ "$just_archived" = "1" ] && [ ! -d "$DATA" ] && [ -d "$STATE_BASE/accounts/$target" ]; then
+            copy_tree "$STATE_BASE/accounts/$target" "$DATA" || { echo "FAIL:恢复账号失败,快照已保留"; return 1; }
         fi
-        open -a "Claude"
+        launch_claude
         echo "INFO:当前已是账号$target"
         return 0
     fi
 
     quit_claude || { echo "FAIL:Claude 未能退出，请手动退出后重试"; return 1; }
 
-    [ "$just_archived" = "0" ] && [ "$cur" != "none" ] && [ -d "$DATA" ] && archive_current "$cur"
+    if [ "$just_archived" = "0" ] && [ "$cur" != "none" ] && [ -d "$DATA" ]; then
+        archive_current "$cur" || { echo "FAIL:账号归档失败,已停止切换"; return 1; }
+    fi
 
     rm -rf "$DATA.new"
     t0=$(date +%s)
-    if [ -d "$BASE/accounts/$target" ]; then
-        copy_tree "$BASE/accounts/$target" "$DATA.new"
+    if [ -d "$STATE_BASE/accounts/$target" ]; then
+        copy_tree "$STATE_BASE/accounts/$target" "$DATA.new" || { echo "FAIL:载入账号失败,快照已保留"; return 1; }
         log "已载入账号$target 存档 ($(( $(date +%s) - t0 ))s)"
     else
         mkdir -p "$DATA.new"
         log "账号$target 无存档，将以全新状态初始化"
     fi
-    rm -rf "$DATA" && mv "$DATA.new" "$DATA"
-    echo "$target" > "$BASE/current"
+    if ! { rm -rf "$DATA" && mv "$DATA.new" "$DATA"; }; then
+        echo "FAIL:活动目录提交失败,账号快照和暂存数据已保留"; return 1
+    fi
+    echo "$target" > "$STATE_BASE/current"
 
-    open -a "Claude"
+    launch_claude
     log "已切换到账号$target 并启动 ($(( $(date +%s) - t0 ))s)"
     echo "OK:已切换到账号$target ($(( $(date +%s) - t0 ))s)"
     return 0
@@ -927,12 +1055,12 @@ case "${1:-}" in
         } > "$OUT_FILE" 2>&1
         cat "$OUT_FILE"
         ;;
-    fix) fix ;;
+    fix) acquire_operation_lock && require_exclusive_system && fix ;;
     status) status ;;
-    switch) switch_to "${2:-}" ;;
-    set-region) set_region ;;
-    update) self_update "${2:-}" ;;
-    write-global-rules|write-merge-rules) write_global_rules ;;  # 旧入口仅作兼容,统一写全局脚本
+    switch) acquire_operation_lock && switch_to "${2:-}" ;;
+    set-region) acquire_operation_lock && require_exclusive_system && set_region ;;
+    update) acquire_operation_lock && self_update "${2:-}" ;;
+    write-global-rules|write-merge-rules) acquire_operation_lock && require_exclusive_system && write_global_rules ;;  # 旧入口仅作兼容,统一写全局脚本
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--auto]|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch-fork.sh check|checkdetail|fix|status|switch A|B|set-region|update [--auto]|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac

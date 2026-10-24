@@ -16,10 +16,10 @@ import socket
 import tempfile
 
 
-BEGIN = "// >>> claude-switcher global rules v1 >>>\n"
-USER_BEGIN = "// >>> claude-switcher original script >>>\n"
-USER_END = "// <<< claude-switcher original script <<<\n"
-END = "// <<< claude-switcher global rules v1 <<<\n"
+BEGIN = "// >>> claude-switcher-fork global rules v1 >>>\n"
+USER_BEGIN = "// >>> claude-switcher-fork original script >>>\n"
+USER_END = "// <<< claude-switcher-fork original script <<<\n"
+END = "// <<< claude-switcher-fork global rules v1 <<<\n"
 DOMAINS = (
     "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
     "challenges.cloudflare.com", "datadoghq.com", "segment.io", "stripe.com",
@@ -44,12 +44,12 @@ def render_script(original, preferred):
     # The outer null binding prevents an empty user script from capturing the
     # wrapper's hoisted main and recursively calling itself. The inner scope
     # still permits both function main and const/let main entrypoints.
-    return (BEGIN + "const __claudeSwitcherUserMain = (function (main) {\nreturn (function () {\n" + USER_BEGIN +
+    return (BEGIN + "const __claudeSwitcherForkUserMain = (function (main) {\nreturn (function () {\n" + USER_BEGIN +
             user_script(original) + USER_END +
             "return typeof main === 'function' ? main : null;\n})();\n})(null);\n" + template +
             "\nfunction main(config, profileName) {\n" +
-            "  const result = __claudeSwitcherUserMain ? __claudeSwitcherUserMain(config, profileName) : config;\n" +
-            "  return __claudeSwitcherApply(result, " + json.dumps(preferred, ensure_ascii=True) + ");\n}\n" + END)
+            "  const result = __claudeSwitcherForkUserMain ? __claudeSwitcherForkUserMain(config, profileName) : config;\n" +
+            "  return __claudeSwitcherForkApply(result, " + json.dumps(preferred, ensure_ascii=True) + ");\n}\n" + END)
 
 
 def install(root, preferred):
@@ -61,11 +61,11 @@ def install(root, preferred):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup = path.with_name(path.name + ".claude-switcher-" + stamp + ".bak")
+        backup = path.with_name(path.name + ".claude-switcher-fork-" + stamp + ".bak")
         with backup.open("x", encoding="utf-8") as handle:
             os.chmod(backup, 0o600)
             handle.write(original)
-    fd, temporary = tempfile.mkstemp(prefix=".claude-switcher-", dir=str(path.parent))
+    fd, temporary = tempfile.mkstemp(prefix=".claude-switcher-fork-", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(result)

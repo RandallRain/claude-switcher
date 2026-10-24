@@ -79,6 +79,15 @@ class GlobalScriptTests(unittest.TestCase):
         self.assertIn("DOMAIN-SUFFIX,bilibili.com,DIRECT", output["rules"])
         self.assertLess(output["rules"].index("DST-PORT,3478,Proxy A"), output["rules"].index("DOMAIN-SUFFIX,bilibili.com,DIRECT"))
 
+    def test_fork_wrapper_retains_an_existing_upstream_wrapper(self):
+        original = 'function main(config) { config.upstream = "retained"; return config; }\n'
+        upstream = rules.render_script(original, 'Proxy A').replace('claude-switcher-fork', 'claude-switcher')
+        upstream = upstream.replace('__claudeSwitcherFork', '__claudeSwitcher')
+        wrapped = rules.render_script(upstream, 'Proxy A')
+        self.assertEqual(rules.user_script(wrapped), upstream)
+        self.assertEqual(evaluate_script(wrapped, config())['upstream'], 'retained')
+        self.assertEqual(rules.render_script(wrapped, 'Proxy A'), wrapped)
+
     def test_const_arrow_entrypoint_also_survives_wrapper(self):
         original = 'const main = (cfg, name) => { cfg.profile = name; return cfg; };\n'
         output = evaluate_script(rules.render_script(original, "Proxy A"), config(), "B")

@@ -1,22 +1,19 @@
 #!/bin/bash
-clear
-echo "=============================="
-echo "  Claude 账号切换器 - 卸载"
-echo "=============================="
-echo ""
-sudo launchctl bootout system/local.claude-bodyguard 2>/dev/null
-sudo launchctl bootout system/local.tz-watchdog 2>/dev/null
-sudo launchctl bootout system/local.claude-update 2>/dev/null
-sudo rm -f /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist /Library/LaunchDaemons/local.claude-update.plist
-sudo rm -rf "/Library/Application Support/claude-switcher"
-launchctl bootout "gui/$(id -u)/local.claude-update" 2>/dev/null
-rm -f "$HOME/Library/LaunchAgents/local.claude-update.plist"
-rm -rf "$HOME/Desktop/Claude切换器.app"
-rm -f "$HOME/.local/bin/claude-switch.sh" "$HOME/.local/bin/claude-bodyguard.sh" "$HOME/.local/bin/tz-watchdog.sh" "$HOME/.local/bin/local.claude-bodyguard.plist" "$HOME/.local/bin/local.tz-watchdog.plist" "$HOME/.local/bin/local.claude-update.plist" "$HOME/.local/bin/claude-switch.sh.bak" "$HOME/.local/bin/claude-bodyguard.sh.bak" "$HOME/.local/bin/tz-watchdog.sh.bak"
-echo ""
-echo "✅ 已卸载。"
-echo "注意: 账号存档保留在 ~/.claude-switcher/(含你的登录态),要删干净可手动: rm -rf ~/.claude-switcher"
-echo "置顶规则保留: Clash Verge → 全局扩展脚本(Global Extend Script)可查看 claude-switcher 标记。"
-echo "如需移除,请保留 original script 标记之间的原用户代码;其他客户端的规则请自行检查。"
-echo ""
-read -n 1 -s -r -p "按任意键关闭窗口..."
+# 只卸载 fork 的程序和服务,保留两版账号资料及原版安装。
+set -euo pipefail
+pkill -x ClaudeSwitcher-fork 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/local.claude-update-fork" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/local.claude-update-fork.plist"
+sudo /bin/bash <<'ROOT'
+set -e
+for label in local.claude-bodyguard-fork local.tz-watchdog-fork; do
+    launchctl bootout "system/$label" 2>/dev/null || true
+    rm -f "/Library/LaunchDaemons/$label.plist"
+done
+rm -rf '/Library/Application Support/claude-switcher-fork'
+ROOT
+rm -f "$HOME/.local/bin/claude-switch-fork.sh" "$HOME/.local/bin/claude-switch-fork.sh.bak"
+rm -rf "$HOME/Desktop/Claude切换器-fork.app" "$HOME/Desktop/Claude切换器-fork.app.bak"
+echo "已卸载 fork 版程序和服务。原版安装保持原位。"
+echo "fork 账号/缓存保留在 ~/.claude-switcher-fork/;活动 Claude 数据保留在 ~/Library/Application Support/Claude-fork/。"
+echo "代理规则、时区与 IPv6 设置影响整个系统,卸载不会自动改回。"

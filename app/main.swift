@@ -60,16 +60,16 @@ final class VM: ObservableObject {
     @Published var note = ""
     @Published var fingerprint = ""
 
-    let core = NSHomeDirectory() + "/.local/bin/claude-switch.sh"
+    let core = NSHomeDirectory() + "/.local/bin/claude-switch-fork.sh"
 
     func run(_ args: [String], timeout: TimeInterval = 45, done: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let started = Date()
-            let tmp = "/tmp/switcher-out-\(UUID().uuidString).txt"
+            let tmp = "/tmp/switcher-fork-out-\(UUID().uuidString).txt"
             FileManager.default.createFile(atPath: tmp, contents: nil,
                                            attributes: [.posixPermissions: 0o600])
             let p = Process()
-            p.launchPath = "/bin/bash"
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
             p.arguments = [self.core] + args
             if let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: tmp)) {
                 p.standardOutput = fh
@@ -80,7 +80,7 @@ final class VM: ObservableObject {
                 if p.isRunning { timedOut = true; p.terminate() }
             }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
-            do { try p.launch() } catch {
+            do { try p.run() } catch {
                 DispatchQueue.main.async { done("FAIL:无法启动脚本 \(error.localizedDescription)") }
                 return
             }
@@ -91,9 +91,9 @@ final class VM: ObservableObject {
             let out = String(decoding: data, as: UTF8.self)  // 容错解码:坏字节替换而非整体失败
             try? FileManager.default.removeItem(atPath: tmp)
             let dbg = "[\(Date())] args=\(args) timedOut=\(timedOut) exit=\(p.terminationStatus) 耗时\(String(format: "%.1f", Date().timeIntervalSince(started)))s stdout=\(out.count)字符\n"
-            if let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/switcher-debug.log")) {
+            if let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/switcher-fork-debug.log")) {
                 h.seekToEndOfFile(); h.write(dbg.data(using: .utf8)!); h.closeFile()
-            } else { try? dbg.write(toFile: "/tmp/switcher-debug.log", atomically: true, encoding: .utf8) }
+            } else { try? dbg.write(toFile: "/tmp/switcher-fork-debug.log", atomically: true, encoding: .utf8) }
             if timedOut {
                 DispatchQueue.main.async { done("FAIL:操作超时，请重试") }
                 return
@@ -110,7 +110,7 @@ final class VM: ObservableObject {
         run(["checkdetail"]) { out in
             // 输出为空时回退到脚本落盘的结果文件(双保险)
             var raw = out
-            if raw.isEmpty, let diskData = try? Data(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.claude-switcher/last-check.txt")), !diskData.isEmpty {
+            if raw.isEmpty, let diskData = try? Data(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.claude-switcher-fork/last-check.txt")), !diskData.isEmpty {
                 raw = String(decoding: diskData, as: UTF8.self)
             }
             let out = raw
@@ -222,7 +222,7 @@ struct ContentView: View {
                 Image(systemName: "shield.lefthalf.filled").font(.title2).foregroundColor(.white)
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text("Claude 账号切换器").font(.title3.bold()).foregroundColor(.white)
+                Text("Claude 账号切换器-fork").font(.title3.bold()).foregroundColor(.white)
                 Text("安全检查 · 切换 · 启动").font(.caption).foregroundColor(.white.opacity(0.55))
             }
             Spacer()
@@ -524,6 +524,17 @@ struct NoticeView: View {
 // MARK: - App
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let upstream = NSRunningApplication.runningApplications(withBundleIdentifier: "local.claude-switcher")
+        if !upstream.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "请先退出原版 Claude 切换器"
+            alert.informativeText = "两版账号数据独立,但系统代理和时区共用;请一次操作一个切换器。"
+            alert.runModal()
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
     // 关闭窗口即退出进程,杜绝"旧实例残留"
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
@@ -533,7 +544,7 @@ struct SwitcherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("Claude切换器-fork") {
             ContentView()
                 .background(WindowAccessor { win in
                     guard let w = win else { return }

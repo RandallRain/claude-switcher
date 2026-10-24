@@ -1,6 +1,6 @@
 // Applied after the user's Global Extend Script main(config, profileName).
 // No network or file access: each subscription resolves its own proxy policy.
-function __claudeSwitcherApply(config, preferredGroup) {
+function __claudeSwitcherForkApply(config, preferredGroup) {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     throw new Error("Claude Switcher: Global Extend Script must return a config object");
   }

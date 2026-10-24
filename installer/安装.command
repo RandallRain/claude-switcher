@@ -1,266 +1,166 @@
 #!/bin/bash
-# Claude 切换器 - 通用安装程序 (macOS)
-cd "$(dirname "$0")"
-REPO="$(cd .. && pwd)"
+# 个人版独立安装:不覆盖原版脚本、账号库、服务或桌面入口。
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 H="$HOME"
-clear
-echo "=================================="
-echo "  Claude 账号切换器 · 安装程序"
-echo "=================================="
-echo ""
+CORE="$H/.local/bin/claude-switch-fork.sh"
+BASE="$H/.claude-switcher-fork"
+APP="$H/Desktop/Claude切换器-fork.app"
+SYSTEM_DIR="/Library/Application Support/claude-switcher-fork"
+echo "Claude 账号切换器-fork · 安装程序"
+[ "$(uname -s)" = Darwin ] || { echo "需要 macOS"; exit 1; }
+[ -d /Applications/Claude.app ] || { echo "请先安装 /Applications/Claude.app"; exit 1; }
+python3 --version >/dev/null
+command -v swiftc >/dev/null || { echo "请先安装 Xcode 命令行工具"; exit 1; }
 
-# 国家代码 → 地区格式映射(未收录的国家回退 en_US)
-locale_for() {
-    case "$1" in
-        US) echo en_US ;; JP) echo ja_JP ;; TW) echo zh_TW ;; HK) echo zh_HK ;;
-        SG) echo en_SG ;; GB) echo en_GB ;; DE) echo de_DE ;; FR) echo fr_FR ;;
-        KR) echo ko_KR ;; AU) echo en_AU ;; CA) echo en_CA ;; *) echo en_US ;;
-    esac
-}
+# 安装前核验出口,只保留国家代码,不记录真实地址。
+CTRY=$(curl -fsS --max-time 20 https://www.cloudflare.com/cdn-cgi/trace | awk -F= '$1=="loc" {print $2}')
+case "$CTRY" in ''|CN) echo "出口国家未取得或为 CN,请先配置代理"; exit 1;; esac
+[[ "$CTRY" =~ ^[A-Z][A-Z]$ ]] || { echo "出口国家格式异常"; exit 1; }
 
-# ---- 0. 前置检查 ----
+# 升级沿用个人版配置;首次只读取旧安装的五项非账号配置。
+CONFIG="$CORE"
+[ -f "$CONFIG" ] || CONFIG="$H/.local/bin/claude-switch.sh"
+get_cfg() { if [ -f "$CONFIG" ]; then sed -n "s/^$1=\"\([^\"]*\)\".*/\1/p" "$CONFIG" | head -1; fi; }
 CLASH_DIR="$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
-if [ -d "$CLASH_DIR" ]; then
-    MODE="clash-verge"
-elif scutil --nc list 2>/dev/null | grep -q 'com.liguangming.Shadowrocket'; then
-    MODE="shadowrocket"
-else
-    echo "未自动识别到代理客户端,请手动选择:"
-    echo "  1) clash-verge    2) shadowrocket    3) sing-box"
-    echo "  4) clashx         5) surge           6) auto(任一命中即活)"
-    read -r -p "请输入序号或名称: " pick
-    case "$pick" in
-        1|clash-verge)  MODE="clash-verge" ;;
-        2|shadowrocket) MODE="shadowrocket" ;;
-        3|sing-box)     MODE="sing-box" ;;
-        4|clashx)       MODE="clashx" ;;
-        5|surge)        MODE="surge" ;;
-        6|auto)         MODE="auto" ;;
-        *) echo "未识别的选择,退出"; exit 1 ;;
-    esac
+MODE=$(get_cfg PROXY_MODE)
+if [ -z "$MODE" ]; then
+    if [ -d "$CLASH_DIR" ]; then MODE=clash-verge
+    elif scutil --nc list | grep -q com.liguangming.Shadowrocket; then MODE=shadowrocket
+    else read -r -p "代理客户端(clash-verge/shadowrocket/sing-box/clashx/surge/auto): " MODE; fi
 fi
-echo "✓ 代理客户端: $MODE"
-if [ ! -d /Applications/Claude.app ]; then
-    echo "⚠️  未检测到 Claude 桌面版(/Applications/Claude.app),请先安装。"
-    read -n 1 -s -r -p "按任意键退出..."; exit 1
-fi
-if ! python3 --version >/dev/null 2>&1; then
-    echo "⚠️  未检测到 python3,请先安装 Xcode 命令行工具: xcode-select --install"
-    read -n 1 -s -r -p "按任意键退出..."; exit 1
-fi
-if ! command -v swiftc >/dev/null 2>&1; then
-    echo "⚠️  未检测到 swiftc(界面 App 需要现场编译),请先运行: xcode-select --install"
-    echo "   注意:macOS 26/27 上仅装 Command Line Tools 可能因缺少 SwiftUIMacros 插件编译失败,"
-    echo "   如遇失败请安装完整 Xcode 并执行: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
-    read -n 1 -s -r -p "按任意键退出..."; exit 1
-fi
-echo "✓ 前置检查通过($MODE / Claude / python3 / swiftc)"
-
-# ---- 1. 自动探测代理组名(仅 Clash Verge;多个 select 组时让用户选,避免静默选错专线) ----
-GRP=""
-if [ "$MODE" = "clash-verge" ]; then
+case "$MODE" in clash-verge|shadowrocket|sing-box|clashx|surge|auto) ;; *) echo "不支持的代理客户端"; exit 1;; esac
+GRP="${CLAUDE_SWITCHER_PROXY_GROUP:-$(get_cfg PROXY_GROUP)}"
+if [ "$MODE" = clash-verge ] && [ -z "$GRP" ]; then
     GRPS=()
     while IFS= read -r g; do GRPS+=("$g"); done < <(awk '
         /^proxy-groups:/ {f=1; next}
         f && /^[a-zA-Z]/ {f=0}
         f && /- name:/ { n=$0; sub(/.*- name: */, "", n); gsub(/"/, "", n) }
         f && /type: *select/ { print n }
-    ' "$CLASH_DIR/clash-verge.yaml" 2>/dev/null)
-    if [ "${#GRPS[@]}" -eq 0 ]; then
-        echo ""
-        echo "未能自动识别你的代理组名,请打开 Clash Verge 查看「代理」页面顶部的组名。"
-        read -r -p "请输入代理组名: " GRP
-        [ -z "$GRP" ] && { echo "未输入,退出"; exit 1; }
-    elif [ "${#GRPS[@]}" -eq 1 ]; then
-        GRP="${GRPS[0]}"
+    ' "$CLASH_DIR/clash-verge.yaml")
+    if [ "${#GRPS[@]}" -eq 1 ]; then GRP="${GRPS[0]}"
     else
-        echo ""
-        echo "检测到多个代理组,请选择用于 Claude 专线的那个:"
-        i=1
-        for g in "${GRPS[@]}"; do echo "  $i) $g"; i=$((i+1)); done
-        read -r -p "请输入序号: " pick
-        case "$pick" in ''|*[!0-9]*) echo "输入无效,退出"; exit 1 ;; esac
-        if [ "$pick" -lt 1 ] || [ "$pick" -gt "${#GRPS[@]}" ]; then
-            echo "序号超范围,退出"; exit 1
-        fi
-        GRP="${GRPS[$((pick-1))]}"
+        printf '可用代理组:\n'; printf '  %s\n' "${GRPS[@]}"
+        read -r -p "请输入 Claude 代理组名称: " GRP
     fi
-    echo "✓ 代理组: $GRP"
+    [ -n "$GRP" ] || { echo "代理组不能为空"; exit 1; }
 fi
-
-# ---- 2. 地区自适应(按出口IP自动锁定 国家/时区/地区格式;必须先挂代理) ----
-IPINFO=$(curl -fs --max-time 20 --retry 2 --retry-all-errors https://ipinfo.io/json 2>/dev/null)
-CTRY=$(echo "$IPINFO" | grep '"country"' | cut -d'"' -f4)
-if [ "$CTRY" = "CN" ] && [ -z "$FORCE" ]; then
-    echo ""
-    echo "❌ 检测到当前出口在国内(国家: CN)。"
-    echo "   请先在代理客户端里开启代理(TUN模式)并确认节点可用,再运行本安装程序。"
-    echo "   (否则时区/地区会被错误锁定)"
-    read -n 1 -s -r -p "按任意键退出..."; exit 1
+OLD_COUNTRY=$(get_cfg COUNTRY_TARGET)
+if [ -n "$OLD_COUNTRY" ] && [ "$OLD_COUNTRY" != "$CTRY" ]; then
+    echo "出口国家 $CTRY 与现有目标 $OLD_COUNTRY 不一致,请先用现有版本 set-region"; exit 1
 fi
-if [ -z "$CTRY" ]; then
-    echo "⚠️  未能识别出口国家,请确认代理已开启后重试(或用 FORCE=1 跳过)。"
-    [ -z "$FORCE" ] && { read -n 1 -s -r -p "按任意键退出..."; exit 1; }
-    CTRY="US"
+TZV=$(get_cfg TZ_TARGET)
+LOCALE=$(get_cfg LOCALE_TARGET)
+if [ -z "$TZV" ] || [ -z "$LOCALE" ]; then
+    REGION=$(curl -fsS --max-time 20 https://ipinfo.io/json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("country","")); print(d.get("timezone",""))')
+    [ "$(printf '%s\n' "$REGION" | head -1)" = "$CTRY" ] || { echo "出口国家交叉核验失败"; exit 1; }
+    TZV=$(printf '%s\n' "$REGION" | tail -1)
+    case "$CTRY" in
+        US) LOCALE=en_US;; JP) LOCALE=ja_JP;; TW) LOCALE=zh_TW;; HK) LOCALE=zh_HK;;
+        SG) LOCALE=en_SG;; GB) LOCALE=en_GB;; DE) LOCALE=de_DE;; FR) LOCALE=fr_FR;;
+        KR) LOCALE=ko_KR;; AU) LOCALE=en_AU;; CA) LOCALE=en_CA;; *) LOCALE=en_US;;
+    esac
 fi
-TZV=$(echo "$IPINFO" | grep '"timezone"' | cut -d'"' -f4)
-[ -z "$TZV" ] && TZV="America/New_York"
-LOCALE=$(locale_for "$CTRY")
-echo "✓ 地区自适应: 国家=$CTRY 时区=$TZV 地区格式=$LOCALE (按当前出口IP自动识别)"
+[ -n "$TZV" ] || { echo "未取得目标时区"; exit 1; }
+echo "配置: $MODE / $CTRY / $TZV / $LOCALE"
 
-# ---- 3. 安装文件 ----
-mkdir -p "$H/.local/bin" "$H/.claude-switcher" "$H/Library/Logs"
-cp "$REPO/core/claude-switch.sh" "$H/.local/bin/"
-cp "$REPO/core/stun-probe.py" "$REPO/core/clash-rules.py" \
-   "$REPO/core/clash-global-rules.js" "$H/.claude-switcher/"
-chmod +x "$H/.local/bin/claude-switch.sh"
-# 写入探测到的客户端/代理组名/地区目标
-sed -i '' \
-    -e "s|^PROXY_MODE=\".*\"|PROXY_MODE=\"$MODE\"|" \
-    -e "s|^PROXY_GROUP=\".*\"|PROXY_GROUP=\"$GRP\"|" \
-    -e "s|^COUNTRY_TARGET=\".*\"|COUNTRY_TARGET=\"$CTRY\"|" \
-    -e "s|^TZ_TARGET=\".*\"|TZ_TARGET=\"$TZV\"|" \
-    -e "s|^LOCALE_TARGET=\".*\"|LOCALE_TARGET=\"$LOCALE\"|" \
-    "$H/.local/bin/claude-switch.sh"
-
-# 保镖/时区看门狗脚本:物化到临时目录,由 sudo 段装入 root 所有的系统目录(用户态不可写,防提权)
+# 先编译及物化所有文件;编译失败不会覆盖现有 App/核心。
 STAGE=$(mktemp -d)
-sed -e "s|__HOME__|$H|g" -e "s|__PROXY_MODE__|$MODE|g" \
-    "$REPO/daemons/claude-bodyguard.sh" > "$STAGE/claude-bodyguard.sh"
-sed -e "s|__HOME__|$H|g" -e "s|__TZ_TARGET__|$TZV|g" \
-    "$REPO/daemons/tz-watchdog.sh" > "$STAGE/tz-watchdog.sh"
-chmod +x "$STAGE/claude-bodyguard.sh" "$STAGE/tz-watchdog.sh"
-# 清理旧版本装在用户目录下的守护脚本(用户可写=提权面)
-rm -f "$H/.local/bin/claude-bodyguard.sh" "$H/.local/bin/tz-watchdog.sh" \
-      "$H/.local/bin/claude-bodyguard.sh.bak" "$H/.local/bin/tz-watchdog.sh.bak"
+trap 'rm -rf "$STAGE"' EXIT
+bash "$REPO/scripts/build-macos-app.sh" "$REPO" "$STAGE/Claude切换器-fork.app" fork
+python3 - "$REPO" "$STAGE" "$H" "$MODE" "$GRP" "$CTRY" "$TZV" "$LOCALE" "$(id -u)" <<'PY'
+import pathlib,re,sys
+repo,stage=map(pathlib.Path,sys.argv[1:3]); home,mode,group,country,tz,locale,uid=sys.argv[3:]
+values=dict(PROXY_MODE=mode,PROXY_GROUP=group,COUNTRY_TARGET=country,TZ_TARGET=tz,LOCALE_TARGET=locale)
+text=(repo/'core/claude-switch.sh').read_text()
+for key,value in values.items():
+    if any(c in value for c in '\n\r"`$\\'): raise SystemExit('配置含不支持的 shell 字符: '+key)
+    text=re.sub(r'^'+key+r'="[^"]*"',lambda _:key+'="'+value+'"',text,flags=re.M)
+(stage/'claude-switch-fork.sh').write_text(text)
+for name in ('claude-bodyguard.sh','tz-watchdog.sh','local.claude-update.plist'):
+    text=(repo/'daemons'/name).read_text().replace('__HOME__',home).replace('__PROXY_MODE__',mode).replace('__TZ_TARGET__',tz).replace('__USER_UID__',uid)
+    (stage/name).write_text(text)
+PY
+if [ -n "${DRYRUN:-}" ]; then echo "演练完成,未修改安装态"; exit 0; fi
 
-# launchd 配置(保镖/看门狗的 ProgramArguments 已指向系统目录,直接拷贝;自动更新为 LaunchAgent)
-cp "$REPO/daemons/local.claude-bodyguard.plist" "$REPO/daemons/local.tz-watchdog.plist" "$H/.local/bin/"
-sed "s|__HOME__|$H|g" "$REPO/daemons/local.claude-update.plist" > "$H/.local/bin/local.claude-update.plist"
-echo "✓ 核心文件已安装"
-
-# ---- 4. 现场编译 App 到桌面 ----
-APP="$H/Desktop/Claude切换器.app"
-mkdir -p "$H/Desktop"
-pkill -x ClaudeSwitcher 2>/dev/null
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-# 必须带 -target,否则新 SDK 编出的二进制在老系统被拒启动
-if swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
-    "$REPO/app/main.swift" -o "$APP/Contents/MacOS/ClaudeSwitcher" \
-    -framework SwiftUI -framework AppKit; then
-    echo "✓ App 编译完成"
+# 系统级设置无法分成两份;两套看门狗目标冲突时先中止安装。
+OTHER_WD='/Library/Application Support/claude-switcher/tz-watchdog.sh'
+if launchctl print system/local.tz-watchdog >/dev/null 2>&1 && [ -f "$OTHER_WD" ]; then
+    OTHER_TZ=$(sed -n 's/^TARGET=//p' "$OTHER_WD" | head -1)
+    OTHER_TZ=${OTHER_TZ#\"}; OTHER_TZ=${OTHER_TZ%\"}
+    if [ -n "$OTHER_TZ" ] && [ "$OTHER_TZ" != "$TZV" ]; then echo "两版时区看门狗目标冲突,请先统一目标"; exit 1; fi
+fi
+cat > "$STAGE/install-system.sh" <<'ROOT'
+#!/bin/bash
+set -euo pipefail
+stage=$1; repo=$2; target=$3
+install -d -o root -g wheel -m 755 '/Library/Application Support/claude-switcher-fork'
+for name in claude-bodyguard.sh tz-watchdog.sh; do
+    install -o root -g wheel -m 755 "$stage/$name" "/Library/Application Support/claude-switcher-fork/$name"
+done
+for label in local.claude-bodyguard local.tz-watchdog; do
+    install -o root -g wheel -m 644 "$repo/daemons/$label.plist" "/Library/LaunchDaemons/$label-fork.plist"
+    launchctl bootout "system/$label-fork" 2>/dev/null || true
+    launchctl bootstrap system "/Library/LaunchDaemons/$label-fork.plist"
+done
+case "$(readlink /etc/localtime)" in */"$target") ;; *) /usr/sbin/systemsetup -settimezone "$target";; esac
+if ! networksetup -getinfo Wi-Fi | grep -qi '^IPv6: *Off'; then networksetup -setv6off Wi-Fi; fi
+ROOT
+# 管理员授权只执行已物化的安装步骤;日常与自动更新均为用户态。
+if sudo -n true 2>/dev/null; then
+    sudo /bin/bash "$STAGE/install-system.sh" "$STAGE" "$REPO" "$TZV"
 else
-    echo "✗ App 编译失败。若日志提示 SwiftUIMacros/插件缺失(macOS 26/27 常见),"
-    echo "  请安装完整 Xcode 后执行: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
-    read -n 1 -s -r -p "按任意键退出..."; exit 1
+    osascript - "$STAGE/install-system.sh" "$STAGE" "$REPO" "$TZV" <<'AS'
+on run argv
+    set cmd to "/bin/bash "
+    repeat with arg in argv
+        set cmd to cmd & quoted form of (arg as text) & " "
+    end repeat
+    do shell script cmd with prompt "安装 fork 版独立后台服务" with administrator privileges
+end run
+AS
 fi
-# 图标: assets/ 里有 PNG 源文件时现场生成 icns
-PNG="$REPO/assets/icon-2048.png"
-if [ -f "$PNG" ]; then
-    ICONSET="$(mktemp -d)/AppIcon.iconset"
-    mkdir -p "$ICONSET"
-    for sz in 16 32 128 256 512; do
-        sips -z "$sz" "$sz" "$PNG" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null 2>&1
-        sips -z $((sz*2)) $((sz*2)) "$PNG" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1
-    done
-    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null \
-        && echo "✓ 图标已生成" || echo "⚠️  图标生成失败(不影响使用)"
-fi
-cat > "$APP/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>CFBundleExecutable</key><string>ClaudeSwitcher</string>
-	<key>CFBundleIdentifier</key><string>local.claude-switcher</string>
-	<key>CFBundleName</key><string>Claude切换器</string>
-	<key>CFBundleDisplayName</key><string>Claude切换器</string>
-	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0</string>
-	<key>CFBundleVersion</key><string>1</string>
-	<key>LSMinimumSystemVersion</key><string>13.0</string>
-	<key>CFBundleIconFile</key><string>AppIcon</string>
-	<key>NSHighResolutionCapable</key><true/>
-</dict>
-</plist>
-EOF
-codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
-echo "✓ App 已放到桌面"
+echo "fork 独立系统服务已安装"
 
-# ---- 5. Global Extend Script(全部订阅;保留已有用户脚本) ----
-if [ "$MODE" = "clash-verge" ]; then
-    # 与 fix() 复用同一入口,不再向旧 Merge.yaml 写 prepend-rules。
-    if "$H/.local/bin/claude-switch.sh" write-global-rules; then
-        echo "✓ 全局扩展脚本已更新(保留已有脚本;所有订阅生效;重启后核验)"
-    else
-        echo "⚠️  置顶规则写入失败,可稍后运行 claude-switch.sh fix 重试"
+mkdir -p "$H/.local/bin" "$BASE" "$H/Desktop" "$H/Library/LaunchAgents" "$H/Library/Logs"
+pkill -x ClaudeSwitcher-fork 2>/dev/null || true
+[ ! -f "$CORE" ] || cp -p "$CORE" "$CORE.bak"
+install -m 755 "$STAGE/claude-switch-fork.sh" "$CORE"
+for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
+    install -m 600 "$REPO/core/$helper" "$BASE/$helper"
+done
+if [ -d "$APP" ]; then
+    rm -rf "$APP.bak"
+    mv "$APP" "$APP.bak"
+fi
+mv "$STAGE/Claude切换器-fork.app" "$APP"
+install -m 600 "$STAGE/local.claude-update.plist" "$H/Library/LaunchAgents/local.claude-update-fork.plist"
+launchctl bootout "gui/$(id -u)/local.claude-update-fork" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$H/Library/LaunchAgents/local.claude-update-fork.plist"
+echo "fork App、核心与每12小时更新任务已安装"
+
+# TUN/代理规则是系统共享资源;已生效时只读核验,不重启代理。
+if [ "$MODE" = clash-verge ]; then
+    if ! python3 "$BASE/clash-rules.py" check --directory "$CLASH_DIR" --group "$GRP" >/dev/null 2>&1; then
+        "$CORE" write-global-rules
+        # 原版 Claude 活跃时 write-global-rules 会拒绝,不会中断原版会话。
+        if pgrep -f '/Applications/Claude.app/Contents/MacOS/Claude' >/dev/null; then
+            echo "请退出 Claude 后运行 fork 一键修复以重载规则"; exit 1
+        fi
+        osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1 || true
+        sleep 2
+        open -a 'Clash Verge'
+        sleep 3
     fi
 else
-    echo "ℹ️  当前客户端为 $MODE,请自行在客户端中添加 DOMAIN-SUFFIX 置顶规则:"
-    echo "    claude.ai / claude.com / anthropic.com / claudeusercontent.com"
-    echo "    challenges.cloudflare.com / datadoghq.com / segment.io"
-    echo "    stripe.com / stripe.network / stripecdn.com"
-    echo "    intercom.io / intercomcdn.com / intercomassets.com"
+    echo "请在代理客户端中添加 README 所列域名、STUN 端口与参考出口规则"
 fi
 
-# ---- 6. 系统级配置(需要一次密码;时区/IPv6 已是目标值则跳过对应命令) ----
-if [ -n "$DRYRUN" ]; then
-    echo "[演练模式] 跳过系统级配置(守护进程/时区/IPv6)"
-    rm -rf "$STAGE"
-else
-    # 守护脚本装入 root 所有的系统目录;同时清理旧版的 root 级自动更新(已改为用户态 LaunchAgent)
-    SYSCMDS="mkdir -p '/Library/Application Support/claude-switcher';
-        cp '$STAGE/claude-bodyguard.sh' '$STAGE/tz-watchdog.sh' '/Library/Application Support/claude-switcher/';
-        chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
-        chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
-        cp '$H/.local/bin/local.claude-bodyguard.plist' '$H/.local/bin/local.tz-watchdog.plist' /Library/LaunchDaemons/;
-        chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
-        chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
-        launchctl bootout system/local.claude-bodyguard 2>/dev/null; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist;
-        launchctl bootout system/local.tz-watchdog 2>/dev/null; launchctl bootstrap system /Library/LaunchDaemons/local.tz-watchdog.plist;
-        launchctl bootout system/local.claude-update 2>/dev/null; rm -f /Library/LaunchDaemons/local.claude-update.plist;"
-    curt=$(readlink /etc/localtime 2>/dev/null)
-    [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SYSCMDS="$SYSCMDS /usr/sbin/systemsetup -settimezone '$TZV';"
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || SYSCMDS="$SYSCMDS networksetup -setv6off Wi-Fi;"
-    SYSCMDS="$SYSCMDS dscacheutil -flushcache; killall -HUP mDNSResponder"
-    echo ""
-    echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV) + 关闭IPv6"
-    sudo bash -c "$SYSCMDS" && echo "✓ 系统级配置完成" || echo "✗ 系统级配置被取消,可稍后重新运行安装程序"
-    rm -rf "$STAGE"
-
-    # 自动更新:用户态 LaunchAgent(每12小时),不走 root,降低供应链风险
-    mkdir -p "$H/Library/LaunchAgents"
-    cp "$H/.local/bin/local.claude-update.plist" "$H/Library/LaunchAgents/local.claude-update.plist"
-    launchctl bootout "gui/$(id -u)/local.claude-update" 2>/dev/null
-    if launchctl bootstrap "gui/$(id -u)" "$H/Library/LaunchAgents/local.claude-update.plist" 2>/dev/null; then
-        echo "✓ 自动更新服务已注册(每12小时检查一次)"
-    else
-        echo "⚠️  自动更新服务注册失败,可手动保底: claude-switch.sh update"
-    fi
+# 完整详情仅写私有缓存;安装输出只显示状态,不打印地址。
+DETAILS=$("$CORE" checkdetail)
+printf '%s\n' "$DETAILS" | awk -F= '/^[^#=]+=(ok|warn|fail)(:|$)/ {split($2,a,":"); print $1 "=" a[1]}'
+if [ "$(printf '%s\n' "$DETAILS" | grep -Ec '^[^#=]+=ok(:|$)')" -ne 14 ]; then
+    echo "fork 已安装,部分安检为警告或失败,请打开桌面 App 查看详情"; exit 1
 fi
-
-# ---- 7. 重启 Clash 使规则生效(仅 Clash Verge) ----
-if [ -z "$DRYRUN" ] && [ "$MODE" = "clash-verge" ]; then
-    osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
-    sleep 2
-    open -a "Clash Verge" >/dev/null 2>&1
-fi
-
-# ---- 8. 自检 ----
-echo ""
-echo "=================================="
-echo "  自检结果 (checkdetail)"
-echo "=================================="
-"$H/.local/bin/claude-switch.sh" checkdetail 2>&1 || true
-
-echo ""
-echo "=================================="
-echo "  ✅ 安装完成!"
-echo "  使用: 双击桌面「Claude切换器」"
-echo "  首次使用: 打开后选账号A(自动收编当前登录)"
-echo "  换了其他国家节点后: 运行 claude-switch.sh set-region 一键重新适配"
-echo "  自动更新已启用(每12小时检查一次),也可手动: claude-switch.sh update"
-echo "=================================="
-read -n 1 -s -r -p "按任意键关闭窗口..."
+echo "安装完成: 双击桌面 Claude切换器-fork;新环境需要独立登录"
