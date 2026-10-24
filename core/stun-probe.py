@@ -1,69 +1,185 @@
 #!/usr/bin/env python3
-"""WebRTC 泄漏探测:并发向多个 STUN 服务器(含国内节点)发 UDP Binding 请求。
-走隧道时应得到代理出口 IP,裸连时会暴露真实国内 IP。全程硬超时 10 秒,绝不阻塞。"""
-import socket, struct, os, signal, threading
+"""Bounded IPv4/IPv6 STUN probes and same-family HTTPS egress verification.
 
-SERVERS = [
-    ("stun.miwifi.com", 3478),        # 国内节点:裸连时必有响应
-    ("stun.chat.bilibili.com", 3478), # 国内节点
-    ("stun.l.google.com", 19302),     # 全球节点
-    ("stun.cloudflare.com", 3478),    # 全球节点
-]
+--audit emits a redacted ok|warn|fail result shared by check/checkdetail/fix.
+The legacy RESULT output is retained for older callers; no response is UNKNOWN.
+"""
+import argparse
+import ipaddress
+import os
+import socket
+import struct
+import subprocess
+import threading
+import time
 
-def stun_public_ip(host, port, timeout=2.0):
+
+COOKIE = 0x2112A442
+SERVERS = (
+    ("stun.miwifi.com", 3478),
+    ("stun.chat.bilibili.com", 3478),
+    ("stun.l.google.com", 19302),
+    ("stun.cloudflare.com", 3478),
+)
+REFERENCES = {
+    4: "https://1.1.1.1/cdn-cgi/trace",
+    6: "https://[2606:4700:4700::1111]/cdn-cgi/trace",
+}
+
+
+def normalized_ip(value):
+    address = ipaddress.ip_address(value)
+    return getattr(address, "ipv4_mapped", None) or address
+
+
+def parse_response(data, transaction):
+    """Validate the response and decode IPv4/IPv6 MAPPED/XOR-MAPPED-ADDRESS."""
+    if len(data) < 20:
+        return None
+    kind, size, cookie = struct.unpack("!HHI", data[:8])
+    if (kind != 0x0101 or cookie != COOKIE or data[8:20] != transaction
+            or size % 4 or len(data) < 20 + size):
+        return None
+    end, pos, mapped = 20 + size, 20, None
+    while pos + 4 <= end:
+        atype, length = struct.unpack("!HH", data[pos:pos + 4])
+        if pos + 4 + length > end:
+            return None
+        value = data[pos + 4:pos + 4 + length]
+        if atype in (0x0001, 0x0020) and len(value) >= 4:
+            count = {1: 4, 2: 16}.get(value[1])
+            if count is None or length != count + 4:
+                return None
+            packed = value[4:]
+            if atype == 0x0020:
+                mask = struct.pack("!I", COOKIE) + transaction
+                packed = bytes(a ^ b for a, b in zip(packed, mask[:count]))
+            address = normalized_ip(ipaddress.ip_address(packed))
+            if not address.is_global:
+                return None
+            if atype == 0x0020:
+                return address
+            mapped = address
+        pos += 4 + length + (-length % 4)
+    return mapped
+
+
+def stun_public_ip(host, port, family, timeout=2.0):
     try:
-        addr = socket.gethostbyname(host)
-    except Exception:
-        return None
-    txn = os.urandom(12)
-    req = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txn
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
+        addresses = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
+    except OSError:
+        return {"state": "unavailable"}
+    if not addresses:
+        return {"state": "unavailable"}
+    transaction = os.urandom(12)
+    request = struct.pack("!HHI", 0x0001, 0, COOKIE) + transaction
     try:
-        s.sendto(req, (addr, port))
-        data, _ = s.recvfrom(1024)
-    except Exception:
-        return None
-    finally:
-        s.close()
-    if len(data) < 20 or data[0:2] != b"\x01\x01":
-        return None
-    pos = 20
-    while pos + 4 <= len(data):
-        atype, alen = struct.unpack("!HH", data[pos:pos+4])
-        aval = data[pos+4:pos+4+alen]
-        if atype == 0x0020 and len(aval) >= 8 and aval[1] == 0x01:
-            ip_int = struct.unpack("!I", aval[4:8])[0] ^ 0x2112A442
-            return socket.inet_ntoa(struct.pack("!I", ip_int))
-        if atype == 0x0001 and len(aval) >= 8 and aval[1] == 0x01:
-            return socket.inet_ntoa(aval[4:8])
-        pos += 4 + alen + ((4 - alen % 4) % 4)
-    return None
+        with socket.socket(family, socket.SOCK_DGRAM) as channel:
+            channel.settimeout(timeout)
+            # Connected UDP accepts replies only from the queried endpoint.
+            channel.connect(addresses[0][4])
+            channel.send(request)
+            address = parse_response(channel.recv(2048), transaction)
+        return {"state": "ok", "address": address} if address else {"state": "invalid_response"}
+    except OSError:
+        return {"state": "no_response"}
 
-def _alarm(signum, frame):
-    raise TimeoutError
+
+def reference_egress(version):
+    keep = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+            "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "SYSTEMROOT"}
+    environment = {k: v for k, v in os.environ.items() if k in keep}
+    try:
+        result = subprocess.run(
+            ["curl", "-q", "-fsS", "-" + str(version), "--noproxy", "*",
+             "--proto", "=https", "--connect-timeout", "3", "--max-time", "5",
+             REFERENCES[version]], env=environment, capture_output=True, text=True, timeout=6)
+        if result.returncode:
+            return {"state": "unavailable"}
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        address = normalized_ip(values["ip"])
+        country = values["loc"]
+        if address.version != version or not address.is_global or len(country) != 2 or not country.isalpha():
+            return {"state": "invalid_response"}
+        return {"state": "ok", "address": address, "country": country.upper()}
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        return {"state": "unavailable"}
+
+
+def collect(audit=False, deadline=8.0):
+    """Daemon workers bound DNS stalls too; no signal handlers at import time."""
+    records, references, lock = [], {}, threading.Lock()
+
+    def stun_worker(host, port, family):
+        record = stun_public_ip(host, port, family)
+        record.update(transport=4 if family == socket.AF_INET else 6)
+        with lock:
+            records.append(record)
+
+    def reference_worker(version):
+        value = reference_egress(version)
+        with lock:
+            references[version] = value
+
+    workers = [threading.Thread(target=stun_worker, args=(host, port, family), daemon=True)
+               for host, port in SERVERS for family in (socket.AF_INET, socket.AF_INET6)]
+    if audit:
+        workers += [threading.Thread(target=reference_worker, args=(v,), daemon=True) for v in (4, 6)]
+    stop = time.monotonic() + deadline
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(max(0, stop - time.monotonic()))
+    with lock:
+        return list(records), dict(references)
+
+
+def evaluate(records, references, country):
+    """Never compare IPv4 with IPv6 or label a timeout 'zero exposure'."""
+    addresses = {normalized_ip(record["address"]) for record in records if record.get("state") == "ok"}
+    if not addresses:
+        return "fail", "STUN均无有效响应，无法验证UDP出口（可能阻断、超时或解析失败）"
+    versions = sorted({address.version for address in addresses})
+    for version in versions:
+        reference = references.get(version, {})
+        if reference.get("state") != "ok":
+            return "fail", "IPv%d参考出口不可达，无法验证UDP出口" % version
+        if country and reference.get("country") != country:
+            return "fail", "IPv%d参考出口国家与目标不一致" % version
+        expected = normalized_ip(reference["address"])
+        if expected.version != version:
+            return "fail", "IPv%d参考出口格式异常" % version
+        if any(address != expected for address in addresses if address.version == version):
+            return "fail", "IPv%d UDP出口与同版本参考不一致（疑似直连或代理分流）" % version
+    verified = "/".join("IPv" + str(version) for version in versions)
+    missing = [v for v in (4, 6) if v not in versions and references.get(v, {}).get("state") == "ok"]
+    if missing:
+        return "warn", verified + " UDP出口一致；IPv%d STUN无响应，未验证该路径" % missing[0]
+    return "ok", verified + " UDP出口与同版本参考一致"
+
 
 def main():
-    found = []
-    lock = threading.Lock()
-    def worker(h, p):
-        ip = stun_public_ip(h, p)
-        if ip:
-            with lock:
-                if ip not in found:
-                    found.append(ip)
-    threads = []
-    for h, p in SERVERS:
-        t = threading.Thread(target=worker, args=(h, p), daemon=True)
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join(timeout=3)
-    print("RESULT:" + (",".join(found) if found else "NONE"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--audit", action="store_true")
+    parser.add_argument("--country", default="")
+    args = parser.parse_args()
+    country = args.country.upper()
+    if country and (len(country) != 2 or not country.isalpha()):
+        print("fail:目标国家配置异常")
+        return 1
+    try:
+        records, references = collect(audit=args.audit)
+        if args.audit:
+            status, detail = evaluate(records, references, country)
+            print(status + ":" + detail)
+            return 1 if status == "fail" else 0
+        addresses = sorted({str(r["address"]) for r in records if r.get("state") == "ok"})
+        print("RESULT:" + (",".join(addresses) if addresses else "UNKNOWN"))
+        return 0 if addresses else 1
+    except (OSError, ValueError, KeyError, TypeError):
+        print("fail:STUN检测异常" if args.audit else "RESULT:UNKNOWN")
+        return 1
 
-signal.signal(signal.SIGALRM, _alarm)
-signal.alarm(10)
-try:
-    main()
-except TimeoutError:
-    print("RESULT:NONE")
+
+if __name__ == "__main__":
+    raise SystemExit(main())

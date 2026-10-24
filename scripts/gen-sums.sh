@@ -4,6 +4,9 @@
 cd "$(dirname "$0")/.." || exit 1
 shasum -a 256 \
     core/claude-switch.sh \
+    core/stun-probe.py \
+    core/clash-rules.py \
+    core/clash-global-rules.js \
     daemons/claude-bodyguard.sh \
     daemons/tz-watchdog.sh \
     daemons/local.claude-bodyguard.plist \

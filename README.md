@@ -54,9 +54,13 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ### 2. 纯标准库手写 STUN 协议栈的 WebRTC 泄漏探针
 
-不依赖浏览器内核（headless Chrome 的 ICE 子系统在无人值守场景下根本不工作——我们踩过这个坑），直接用 `socket` + `struct` 手工构造 RFC 5389 Binding Request，解析 XOR-MAPPED-ADDRESS。
+使用 Python 标准库 `socket` + `struct` 构造 STUN Binding Request，验证响应事务 ID，并解析 IPv4/IPv6 的 MAPPED-ADDRESS 与 XOR-MAPPED-ADDRESS。向小米、哔哩哔哩、Google 和 Cloudflare 分别尝试两种地址族；DNS 和网络请求并发执行，整轮最多等待 8 秒。
 
-真正的创新在**交叉验证拓扑**：探测列表同时包含全球节点（Google/Cloudflare）与国内骨干节点——走隧道时应回传代理出口 IP，裸连时国内节点必然秒回并当场抓获真实 IP。两种状态可区分、零误报、不依赖"恰好不通"。
+WebRTC 项将观测到的 IPv4、IPv6 地址分别与同版本的 HTTPS 参考出口比较。参考请求使用 Cloudflare 的 IPv4/IPv6 字面量地址，避免域名在代理侧选址后又变成另一个地址族；一键修复会将参考目标与 STUN 端口置于相同代理策略。网页出口显示 IPv6、STUN 返回正常代理 IPv4 时，不再跨地址族比较而报泄漏。
+
+Clash Verge 模式还会通过本机内核接口核验所选策略确实是支持 UDP 的代理，避免把同国家的直连出口当成代理参考。
+
+同版本地址不同会报告“疑似直连或代理分流”，缺少对应参考出口或所有 STUN 都无有效响应会判定失败；某个已取得参考出口的地址族没有 STUN 响应时显示黄色“未验证该路径”。超时不再被称为“零暴露”。WebRTC 项的说明不输出公网地址。此项只验证探针路径，不运行浏览器，也不覆盖全部 ICE 候选、媒体连接或自定义 STUN/TURN 端口。
 
 ### 3. Fail-Closed Kill-Switch
 
@@ -186,18 +190,15 @@ bash core/claude-switch.sh diagnose-proxy --proxy http://127.0.0.1:18080
 
 常见现象：TUN 正常、出口 IP 正确，但 WebRTC 检测失败，提示暴露了国内 IP。根因通常不是隧道坏了，而是规则集把 `stun.miwifi.com` / `stun.chat.bilibili.com` 这类国内 STUN 域名判为 **DIRECT 直连**——STUN 走的是 UDP，直连规则让它绕过了隧道。
 
-处理方式（按优先级）：
+**运行一次「一键修复」**：先完全退出 Claude，再将受管规则安装到 Clash Verge → **Global Extend Script / 全局扩展脚本**（`profiles/Script.js`），重载并核验内核中的规则。安装器使用同一个入口。Clash Verge 1.7 及以后不再从全局 Merge 的 `prepend-rules` 添加规则，旧 Merge 文件中的文字也不再被当成生效依据。
 
-1. **运行一次「一键修复」**：会在置顶规则里补充 `DST-PORT,3478 / 5349 / 19302` 三条端口级规则，把**所有** STUN/TURN 标准端口的 UDP 流量强制拉回代理（不只那两个域名），然后自动重启 Clash Verge 复测
-2. 手动等价操作：Clash Verge → 全局扩展配置(Merge.yaml) → prepend-rules 顶部加：
-   ```yaml
-   - DST-PORT,3478,IpEqual
-   - DST-PORT,5349,IpEqual
-   - DST-PORT,19302,IpEqual
-   ```
-3. 开全局代理也能消除该告警，但属于过度代理——会让所有国内流量绕路，通常不需要
+全局脚本先调用原用户 `main(config, profileName)`，再前插 Claude 生态域名、双栈参考目标和 `3478 / 5349 / 19302` 端口的代理规则。三条端口代理规则后跟三条 `REJECT` 后备规则，避免节点不支持 UDP 时继续落到直连规则。原分流规则保留；再次修复不会嵌套脚本或重复添加规则，实际修改前会创建权限为 600 的备份。
 
-注意：浏览器插件只能保护该浏览器；系统级根治是让 UDP 进隧道。Claude 自身不用国内 STUN，但你的规则只要允许任意 UDP 直连，其他应用/网页就有暴露真实 IP 的通道。
+规则适用于所有订阅：优先使用安装时指定的代理组；某订阅没有该组时，选择其中首个非直连代理组，再回退到实际节点。没有可用代理策略时，对受保护目标使用 `REJECT`。切换订阅后仍需确认节点国家与地区目标一致。订阅自己的扩展脚本在全局脚本之后执行，若它覆盖规则，检查会提示全局规则未核验，一键修复不会将“写入文件”误报为“已生效”。
+
+GUI 中可在“全局扩展脚本”查看受管块，用户原代码位于 `original script` 标记之间。也可执行 `claude-switch.sh write-global-rules` 写入脚本后自行重载；旧的 `write-merge-rules` 隐藏入口仅作兼容，也会写入全局脚本。
+
+检测、修复和启动审计共用同一套双栈判定。若所有 STUN 都无响应，应检查节点 UDP 转发、DNS 和网络可达性，不能据此认定无泄漏。这些规则保护指定端口及参考/生态目标，其他端口继续遵循原分流；更完整的 WebRTC 防泄漏需要同时检查外网 UDP 策略、IPv6 路由和浏览器 ICE 候选。
 
 工具能兜底技术泄漏，兜不住主动作死。以下每条都是社区里用账号堆出来的教训：
 
@@ -213,7 +214,9 @@ bash core/claude-switch.sh diagnose-proxy --proxy http://127.0.0.1:18080
 ├── app/main.swift          # SwiftUI 界面(单文件)
 ├── core/
 │   ├── claude-switch.sh    # 核心逻辑:审计/切换/修复
-│   └── stun-probe.py       # STUN 探针(手工协议实现)
+│   ├── stun-probe.py       # 双栈 STUN 与同版本参考出口审计
+│   ├── clash-rules.py      # 全局脚本保留/更新及内核规则核验
+│   └── clash-global-rules.js # 全订阅置顶规则模板
 ├── windows/                # Windows 版(PowerShell 核心 + WPF 界面, Beta)
 ├── linux/                  # Linux 版(bash 核心 + systemd 保镖 + 终端菜单, Beta)
 ├── docs/                   # Web 版环境检测页(index.html 等, GitHub Pages 从这里发布) + 项目文档

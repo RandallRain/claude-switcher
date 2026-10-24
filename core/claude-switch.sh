@@ -153,6 +153,8 @@ BASE="$HOME/.claude-switcher"
 LOG="$HOME/Library/Logs/claude-switch.log"
 CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 ROUTE_MISSED=""
+HELPER_DIR="$BASE"
+[ -f "$(dirname "$0")/stun-probe.py" ] && HELPER_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$BASE/accounts"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$LOG"; }
@@ -210,15 +212,9 @@ proxy_alive() {
     esac
 }
 
-# 置顶规则配置检查(仅 Clash Verge):合并配置里是否含置顶规则
-merge_ok() {
-    grep -q "DOMAIN-SUFFIX,claude.ai,$PROXY_GROUP" "$CLASH_DIR/clash-verge.yaml" 2>/dev/null
-}
-
-# STUN/TURN 端口置顶是否已生效(国内直连规则会把 stun.miwifi.com 等判直连,UDP 需按端口强制进隧道)
-stun_ok() {
-    grep -q 'DST-PORT,3478,' "$CLASH_DIR/clash-verge.yaml" 2>/dev/null \
-        || grep -q 'DST-PORT,3478,' "$CLASH_DIR/profiles/Merge.yaml" 2>/dev/null
+# 全局脚本和内核中的完整置顶规则必须同时通过(不能 grep 旧 Merge.yaml)。
+global_rules_ok() {
+    python3 "$HELPER_DIR/clash-rules.py" check --directory "$CLASH_DIR" --group "$PROXY_GROUP" >/dev/null 2>&1
 }
 
 # 置顶规则行为检测:三个生态域名全部解析到 fake-ip 段(198.18.x.x)即视为已置顶;未命中域名记入 ROUTE_MISSED
@@ -296,24 +292,17 @@ check() {
     esac
 
     wr=$(webrtc_test)
-    if [ "$wr" != "RESULT:NONE" ]; then
-        case "$wr" in
-            RESULT:*)
-                wips=${wr#RESULT:}
-                leak=""
-                OLDIFS=$IFS; IFS=','
-                for w in $wips; do [ "$w" != "$ip" ] && leak="$leak $w"; done
-                IFS=$OLDIFS
-                [ -n "$leak" ] && fails="$fails;WebRTC泄漏($leak)" ;;
-            *) fails="$fails;WebRTC检测异常" ;;
-        esac
-    fi
+    case "$wr" in
+        ok:*|warn:*) ;;
+        fail:*) fails="$fails;WebRTC:${wr#fail:}" ;;
+        *) fails="$fails;WebRTC检测异常(请更新探针)" ;;
+    esac
 
     launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || fails="$fails;保镖未运行"
 
-    # 置顶规则:Clash Verge 看配置或行为任一通过;其他客户端只看行为检测
+    # 兼容升级前的规则;WebRTC 仍须核验实际 UDP 代理策略,全局脚本未核验时界面提示修复。
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        merge_ok || route_ok || fails="$fails;置顶规则缺失"
+        global_rules_ok || route_ok || fails="$fails;全局置顶规则未生效"
     else
         route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     fi
@@ -335,9 +324,14 @@ check() {
     return 0
 }
 
-# WebRTC/STUN 探测:返回 RESULT:ip,ip 或 RESULT:NONE 或空
+# 三个入口共用双栈审计:同版本参考比较,无响应不再视为“零暴露”。
 webrtc_test() {
-    python3 "$BASE/stun-probe.py" 2>/dev/null
+    if [ "$PROXY_MODE" = "clash-verge" ] && \
+       ! python3 "$HELPER_DIR/clash-rules.py" proxy-check --directory "$CLASH_DIR" --group "$PROXY_GROUP" >/dev/null 2>&1; then
+        echo 'fail:无法核验Clash的UDP代理策略(可能直连、不支持UDP或规则被覆盖)'
+        return 1
+    fi
+    python3 "$HELPER_DIR/stun-probe.py" --audit --country "$COUNTRY_TARGET" 2>/dev/null
 }
 
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
@@ -387,15 +381,8 @@ checkdetail() {
     esac
     wr=$(webrtc_test)
     case "$wr" in
-        RESULT:NONE) echo 'WebRTC=ok:UDP不出网,零暴露' ;;
-        RESULT:*)
-            wips=${wr#RESULT:}
-            leak=""
-            OLDIFS=$IFS; IFS=','
-            for w in $wips; do [ "$w" != "$ip" ] && leak="$leak $w"; done
-            IFS=$OLDIFS
-            if [ -n "$leak" ]; then echo "WebRTC=fail:暴露非代理IP:$leak"; else echo 'WebRTC=ok:仅暴露代理IP'; fi ;;
-        *) echo 'WebRTC=fail:检测异常' ;;
+        ok:*|warn:*|fail:*) echo "WebRTC=$wr" ;;
+        *) echo 'WebRTC=fail:检测异常(请更新探针)' ;;
     esac
     if launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
@@ -403,12 +390,12 @@ checkdetail() {
     else
         echo '保镖=fail:未安装'
     fi
-    # 置顶规则:Clash Verge 配置/行为双保险,其他客户端只看行为
+    # 全局脚本与实际规则通过才显示绿色;旧配置仅域名行为通过时提示黄色迁移。
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        if merge_ok; then
-            echo '规则置顶=ok'
+        if global_rules_ok; then
+            echo '规则置顶=ok:全局脚本及内核规则已核验'
         elif route_ok; then
-            echo '规则置顶=ok:行为检测通过'
+            echo '规则置顶=warn:域名行为通过,全局脚本未核验,请运行一键修复'
         else
             echo '规则置顶=fail:未生效'
         fi
@@ -452,107 +439,17 @@ checkdetail() {
     fi
 }
 
-# 置顶规则写入(智能合并):不整文件覆盖,用户已有的 Merge 配置原样保留
-# 标记块自包含 prepend-rules 键+全部规则,重复执行幂等
-write_merge_rules() {
-    M="$CLASH_DIR/profiles/Merge.yaml"
-    B0="# >>> claude-switcher pinned rules >>>"
-    B1="# <<< claude-switcher pinned rules <<<"
-    mkdir -p "$CLASH_DIR/profiles"
-    # 置顶规则清单(缩进两格)
-    rules=""
-    for d in claude.ai claude.com anthropic.com claudeusercontent.com challenges.cloudflare.com datadoghq.com segment.io stripe.com stripe.network stripecdn.com intercom.io intercomcdn.com intercomassets.com; do
-        rules="$rules  - DOMAIN-SUFFIX,$d,$PROXY_GROUP
-"
-    done
-    # STUN/TURN 标准端口置顶:即使用户规则集把国内 STUN 域名判为直连,WebRTC 探测的 UDP 也必须进隧道
-    for p in 3478 5349 19302; do
-        rules="$rules  - DST-PORT,$p,$PROXY_GROUP
-"
-    done
-
-    # 首次:文件不存在,整文件写入
-    if [ ! -f "$M" ]; then
-        cat > "$M" <<MEOF
-# Profile Enhancement Merge Template for Clash Verge
-
-profile:
-  store-selected: true
-
-# Claude 全家族及生态域名置顶强制走代理(优先级高于任何国内规则集)
-$B0
-prepend-rules:
-$rules$B1
-MEOF
-        return 0
-    fi
-
-    # 已存在:备份后幂等替换(只在将要修改时备份)
-    cp "$M" "$M.bak.$(date +%Y%m%d%H%M%S)"
-    tmp="$M.cs.tmp"
-    cp "$M" "$tmp"
-    # 删除旧标记块(含标记行,兼容块在 prepend-rules 下缩进的情形)
-    if grep -qF "$B0" "$tmp"; then
-        awk -v b0="$B0" -v b1="$B1" '
-            index($0, b0) {inblock=1; next}
-            inblock && index($0, b1) {inblock=0; next}
-            !inblock
-        ' "$tmp" > "$tmp.out" && mv "$tmp.out" "$tmp"
-        # 清理孤立的 prepend-rules: 键(其后没有规则行,只剩空行/注释/EOF)
-        awk '
-            { L[NR]=$0 }
-            END {
-                for (i=1; i<=NR; i++) {
-                    if (L[i] ~ /^prepend-rules:/) {
-                        has=0
-                        for (j=i+1; j<=NR; j++) {
-                            if (L[j] ~ /^[ \t]*- /) { has=1; break }
-                            if (L[j] ~ /^[ \t]*$/ || L[j] ~ /^[ \t]*#/) continue
-                            break
-                        }
-                        if (!has) continue
-                    }
-                    print L[i]
-                }
-            }
-        ' "$tmp" > "$tmp.out" && mv "$tmp.out" "$tmp"
-    fi
-    # 注入:已有 prepend-rules: 则标记规则块(不带键)插到该行之后,否则文件顶部插入完整块
-    # 注意:多行文本走环境变量传递(macOS awk 的 -v 不支持含换行的字符串);先写中间文件再替换,失败不碰原文件
-    if grep -q '^prepend-rules:' "$tmp"; then
-        if MARK0="$B0" MARK1="$B1" RULES="$rules" awk '
-            /^prepend-rules:/ && !done {
-                print
-                print "  " ENVIRON["MARK0"]
-                printf "%s", ENVIRON["RULES"]
-                print "  " ENVIRON["MARK1"]
-                done=1
-                next
-            }
-            { print }
-        ' "$tmp" > "$tmp.out"; then
-            mv "$tmp.out" "$M" && rm -f "$tmp"
-        else
-            rm -f "$tmp" "$tmp.out"
-            return 1
-        fi
-    else
-        {
-            echo "# Claude 全家族及生态域名置顶强制走代理(优先级高于任何国内规则集)"
-            echo "$B0"
-            echo "prepend-rules:"
-            printf "%s" "$rules"
-            echo "$B1"
-            echo ""
-            cat "$tmp"
-        } > "$tmp.out" && mv "$tmp.out" "$M" && rm -f "$tmp"
-    fi
-    rm -f "$tmp"
+# 全局扩展脚本覆盖所有订阅;保留已有 main,按订阅动态选择代理组。
+write_global_rules() {
+    python3 "$HELPER_DIR/clash-rules.py" install --directory "$CLASH_DIR" --group "$PROXY_GROUP"
 }
 
 # 一键修复:按项自动修复,每步输出结果
 fix() {
     echo "FIX:开始一键修复"
+    # 修复会重载代理;先完全退出 Claude,避免重载期间重新直连。
+    quit_claude || { echo "FIX:Claude 未能完全退出,修复已中止"; return 1; }
+    fix_failed=0
 
     # A. 代理内核 + TUN
     if [ "$PROXY_MODE" = "clash-verge" ]; then
@@ -640,69 +537,44 @@ ASEOF
         echo "FIX:地区格式 → $LOCALE_TARGET ✓"
     fi
 
-    # B2. 置顶规则缺失(含 STUN/TURN 端口) → Clash Verge 智能合并写入 Merge 配置并重启;其他客户端提示自行配置
+    # B2. Global Extend Script:保留用户逻辑,重载后核验实际内核,不只看源文件。
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        if ! merge_ok || ! stun_ok || ! route_ok; then
-            echo "FIX:写入置顶规则(智能合并,不动你的已有配置)..."
-            write_merge_rules
-            osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
-            sleep 3
-            open -a "Clash Verge"
-            for i in $(seq 1 40); do
-                tun_up && break
-                sleep 1
-            done
-            grep -q "DOMAIN-SUFFIX,claude.ai,$PROXY_GROUP" "$CLASH_DIR/clash-verge.yaml" 2>/dev/null \
-                && echo "FIX:置顶规则 ✓" || echo "FIX:置顶规则 ✗"
+        if ! global_rules_ok; then
+            echo "FIX:更新 Global Extend Script(保留已有脚本,对所有订阅生效)..."
+            if write_global_rules; then
+                osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
+                sleep 3
+                open -a "Clash Verge"
+                for i in $(seq 1 12); do
+                    global_rules_ok && tun_up && break
+                    sleep 1
+                done
+                if global_rules_ok; then
+                    echo "FIX:全局置顶规则 ✓(三端口代理/阻断后备及双栈参考路由已加载)"
+                else
+                    echo "FIX:全局置顶规则 ✗(请检查节点UDP支持、代理组及订阅扩展脚本是否覆盖规则)"
+                    fix_failed=1
+                fi
+            else
+                echo "FIX:全局脚本写入失败,已有配置保留"
+                fix_failed=1
+            fi
+        else
+            echo "FIX:全局置顶规则已生效 ✓"
         fi
-    else
-        if ! route_ok; then
-            echo "FIX:置顶规则 ✗(未命中:${ROUTE_MISSED# }) — 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
-        fi
+    elif ! route_ok; then
+        echo "FIX:置顶规则 ✗(未命中:${ROUTE_MISSED# }) — 请在 $(proxy_name) 中添加域名及STUN端口规则"
+        fix_failed=1
     fi
 
-    # C. WebRTC 泄漏专项:在 TUN/IPv6 已处理后复测;UDP 仍绕过隧道时重载 TUN 再测一次
-    wrip=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
+    # C. WebRTC:使用与启动/界面相同的双栈判定,不因跨版本比较反复重启。
     wr=$(webrtc_test)
-    wr_leak() {
-        case "$1" in
-            RESULT:NONE|"") echo "" ;;
-            RESULT:*)
-                wrl=""
-                OLDIFS=$IFS; IFS=','
-                for w in ${1#RESULT:}; do
-                    [ -n "$2" ] && [ "$w" != "$2" ] && wrl="$wrl $w"
-                done
-                IFS=$OLDIFS
-                echo "${wrl# }" ;;
-            *) echo "" ;;
-        esac
-    }
-    leak=$(wr_leak "$wr" "$wrip")
-    if [ "$wr" = "RESULT:NONE" ]; then
-        echo "FIX:WebRTC ✓ (UDP不出网,零暴露)"
-    elif [ -z "$wr" ]; then
-        echo "FIX:WebRTC - 检测无结果(请确认 python3 与 stun-probe.py 就绪)"
-    elif [ -n "$leak" ] && [ "$PROXY_MODE" = "clash-verge" ] && tun_up; then
-        echo "FIX:WebRTC 泄漏($leak),重载 TUN 后复测..."
-        osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
-        sleep 3
-        open -a "Clash Verge"
-        for i in $(seq 1 30); do tun_up && break; sleep 1; done
-        sleep 2
-        wr=$(webrtc_test)
-        leak=$(wr_leak "$wr" "$wrip")
-        if [ "$wr" = "RESULT:NONE" ] || [ -z "$leak" ]; then
-            echo "FIX:WebRTC ✓ (TUN 重载后 UDP 已回到隧道)"
-        else
-            echo "FIX:WebRTC ✗ 仍有 UDP 绕过隧道:${leak:-未知}"
-            echo "FIX:请确认 TUN 已开启且节点支持 UDP;浏览器插件只能保护该浏览器,保护不了 Claude 桌面版和其他应用"
-        fi
-    elif [ -n "$leak" ]; then
-        echo "FIX:WebRTC ✗ UDP 绕过隧道($leak) — 当前客户端无法自动重载,请开启 TUN/UDP 转发"
-    else
-        echo "FIX:WebRTC ✓ (仅暴露代理出口IP)"
-    fi
+    case "$wr" in
+        ok:*) echo "FIX:WebRTC ✓ (${wr#ok:})" ;;
+        warn:*) echo "FIX:WebRTC ⚠ (${wr#warn:})" ;;
+        fail:*) echo "FIX:WebRTC ✗ (${wr#fail:}),请检查节点UDP转发及出口策略"; fix_failed=1 ;;
+        *) echo "FIX:WebRTC ✗ 检测异常(请更新探针)"; fix_failed=1 ;;
+    esac
 
     # D. 出口IP最终验证
     sleep 2
@@ -710,11 +582,13 @@ ASEOF
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then
-        echo "FIX:出口IP ✓ ($ip/$loc)"
+        echo "FIX:出口IP ✓ ($loc)"
     else
-        echo "FIX:出口IP ✗ (${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET) — 可能是节点故障,请到 $(proxy_name) 里换条线路"
+        echo "FIX:出口IP ✗ (${loc:-未知},期望$COUNTRY_TARGET) — 请到 $(proxy_name) 里检查线路"
+        fix_failed=1
     fi
     echo "FIX:修复流程结束"
+    return "$fix_failed"
 }
 
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)
@@ -806,18 +680,54 @@ self_update() {
         echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
     fi
 
-    # 跳过判断:剔除头部5个配置行后与本地已安装版本比对,无差异即已是最新
+    # 跳过判断同时比较辅助工件;探针/全局脚本单独更新也必须分发。
     strip_cfg() { grep -vE '^(PROXY_MODE|PROXY_GROUP|COUNTRY_TARGET|TZ_TARGET|LOCALE_TARGET)="' "$1"; }
-    if [ -f "$BIN/claude-switch.sh" ] && \
+    UPDATE_BASE="$UHOME/.claude-switcher"
+    helpers_changed=0
+    for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
+        cmp -s "$UPDATE_BASE/$helper" "$NEW/core/$helper" || helpers_changed=1
+    done
+    if [ "$helpers_changed" -eq 0 ] && [ -f "$BIN/claude-switch.sh" ] && \
        diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
         echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
     fi
 
     # 备份现有核心脚本
-    [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
+    if [ -f "$BIN/claude-switch.sh" ] && ! cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"; then
+        echo "FAIL:核心脚本备份失败,未执行更新"; rm -rf "$tmpd"; return 1
+    fi
+    mkdir -p "$UPDATE_BASE" "$tmpd/helper-backups"
+    restore_update_helpers() {
+        for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
+            if [ -f "$tmpd/helper-backups/$helper" ]; then
+                cp "$tmpd/helper-backups/$helper" "$UPDATE_BASE/$helper"
+            else
+                rm -f "$UPDATE_BASE/$helper"
+            fi
+        done
+    }
+    for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
+        if [ -f "$UPDATE_BASE/$helper" ] && ! cp "$UPDATE_BASE/$helper" "$tmpd/helper-backups/$helper"; then
+            echo "FAIL:辅助工件备份失败,未执行更新"; rm -rf "$tmpd"; return 1
+        fi
+    done
+    for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
+        if ! cp "$NEW/core/$helper" "$UPDATE_BASE/$helper"; then
+            restore_update_helpers
+            echo "FAIL:辅助工件更新失败,已回滚"; rm -rf "$tmpd"; return 1
+        fi
+    done
+    if [ "$(id -u)" -eq 0 ]; then
+        owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
+        [ -n "$owner" ] && chown "$owner" "$UPDATE_BASE/stun-probe.py" "$UPDATE_BASE/clash-rules.py" "$UPDATE_BASE/clash-global-rules.js"
+    fi
 
     # 替换核心脚本 + 从 .bak 读出5个配置值注入新脚本
-    cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
+    if ! cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"; then
+        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+        restore_update_helpers
+        echo "FAIL:核心脚本更新失败,已回滚"; rm -rf "$tmpd"; return 1
+    fi
     PM=""; PG=""; CT=""; TZV=""; LCT=""
     if [ -f "$BIN/claude-switch.sh.bak" ]; then
         get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh.bak" | head -1 | cut -d'"' -f2; }
@@ -841,8 +751,6 @@ self_update() {
             echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
         fi
     fi
-    rm -rf "$tmpd"
-
     # 更新后自检:root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
     if [ "$(id -u)" -eq 0 ]; then
         owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
@@ -852,9 +760,12 @@ self_update() {
     fi
     if [ -z "$out" ] || echo "$out" | grep -q '=fail'; then
         [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+        restore_update_helpers
+        rm -rf "$tmpd"
         echo "FAIL:新版自检未通过,已自动回滚"
         return 1
     fi
+    rm -rf "$tmpd"
     echo "OK:更新完成 $(date '+%Y-%m-%d')"
     return 0
 }
@@ -1000,7 +911,7 @@ case "${1:-}" in
     switch) switch_to "${2:-}" ;;
     set-region) set_region ;;
     update) self_update "${2:-}" ;;
-    write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
+    write-global-rules|write-merge-rules) write_global_rules ;;  # 旧入口仅作兼容,统一写全局脚本
     fingerprint) fingerprint ;;
     *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--auto]|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac

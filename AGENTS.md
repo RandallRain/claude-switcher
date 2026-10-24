@@ -23,7 +23,7 @@
 
 首选引导用户运行安装器（双击 `installer/安装.command`，或终端执行它）。如果安装器环境受限，按下面的手动等效步骤执行：
 
-1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行），把 `core/stun-probe.py` 放到 `~/.claude-switcher/`
+1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行），把 `core/stun-probe.py`、`core/clash-rules.py`、`core/clash-global-rules.js` 放到 `~/.claude-switcher/`
 2. 探测代理客户端并写进脚本顶部 `PROXY_MODE="..."`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/shadowrocket/sing-box/clashx/surge/auto 中选择
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名写进 `PROXY_GROUP="..."`（其他客户端跳过）
 4. 按出口 IP 自动锁定地区目标：`curl -s ipinfo.io/json` 的 country → `COUNTRY_TARGET`，timezone → `TZ_TARGET`，country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ `LOCALE_TARGET`，三项都写进脚本头部
@@ -33,11 +33,11 @@
    swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o Claude切换器.app/Contents/MacOS/ClaudeSwitcher -framework SwiftUI -framework AppKit
    ```
    图标用 `assets/icon-2048.png` 经 sips 生成 iconset 再 `iconutil -c icns` 打进 `Contents/Resources/AppIcon.icns`，`Info.plist` 声明 `CFBundleIconFile`，最后 `codesign --force --deep -s -`
-7. Clash Verge 模式下把置顶规则写入「全局扩展配置」(Merge.yaml) 并重启 Clash Verge；其他客户端提示用户自行添加 DOMAIN-SUFFIX 置顶规则
+7. Clash Verge 模式运行 `claude-switch.sh write-global-rules`，将规则写入「全局扩展脚本」(Global Extend Script / `profiles/Script.js`) 并重载。保留用户原 `main`，按订阅选择代理组；三条 STUN 端口代理规则后有 `REJECT` 后备，并包含双栈参考出口路由。不要再往全局 Merge 写 `prepend-rules`。其他客户端提示用户自行添加域名、STUN 端口及参考出口规则
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行比对去重 → 备份 .bak → 注入配置 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行并连同辅助工件比对去重 → 备份核心与探针/全局规则工件 → 注入配置并同步辅助文件 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 整组回滚）
 
 ## 独立代理诊断
 
@@ -63,7 +63,7 @@
 | 修改 App 后界面没变化 | 旧进程没死：App 关窗不退 + `pkill` 匹配中文路径会因 Unicode NFD 编码失配而静默失败 | 用 `pkill -x ClaudeSwitcher`（按进程名）；App 必须实现 `applicationShouldTerminateAfterLastWindowClosed` |
 | headless Chrome 做 WebRTC 检测无结果 | headless 模式 ICE 子系统不产出候选 | 不要走浏览器路线，用本项目的纯 Python STUN 探针 |
 | 代理节点报错但流量没泄漏 | 节点被重置时隧道内请求失败≠泄漏；Fail-Closed 下流量只断不绕 | 换线路即可 |
-| WebRTC 检测失败但 TUN 正常 | 规则集把 stun.miwifi.com / stun.chat.bilibili.com 等国内 STUN 判为 DIRECT，UDP 绕过隧道 | 运行 `fix`（会补 DST-PORT,3478/5349/19302 置顶规则并重启 Clash），或手动在 Merge.yaml prepend-rules 加这三条 |
+| WebRTC 检测失败但 TUN 正常 | 国内 STUN 域名可能命中 DIRECT，或同版本参考不可达/出口分流 | 运行 `fix`，通过 Global Extend Script 添加三端口代理及阻断后备规则，并核验实际内核；勿使用旧 Merge prepend-rules。IPv4/IPv6 分别比较，所有探针无响应是“无法验证”，不是“零暴露” |
 | 切换账号后对方看到"新设备" | 正常：快照隔离意味着每个账号有独立设备指纹，这正是设计目标 | 无需处理 |
 
 ## 安全红线（Agent 必须遵守）
@@ -108,6 +108,7 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 
 - 核心逻辑：`core/claude-switch.sh`（安检/切换/修复全在这一个文件）
 - 泄漏探针：`core/stun-probe.py`
+- Clash 全局规则：`core/clash-rules.py` / `core/clash-global-rules.js`（保留原用户脚本，适用于所有订阅）
 - 界面：`app/main.swift`（单文件 SwiftUI）
 - 守护进程模板：`daemons/`
 - 安装器：`installer/`
