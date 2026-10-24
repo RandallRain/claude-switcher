@@ -56,6 +56,7 @@ final class VM: ObservableObject {
     @Published var phase: Phase = .checking
     @Published var current = "?"
     @Published var hasB = false
+    @Published var ownsActiveData = false
     @Published var banner = ""
     @Published var note = ""
     @Published var fingerprint = ""
@@ -142,6 +143,7 @@ final class VM: ObservableObject {
             self.run(["status"]) { st in
                 self.current = st.contains("current=B") ? "B" : (st.contains("current=A") ? "A" : "未初始化")
                 self.hasB = st.contains("hasB=1")
+                self.ownsActiveData = st.contains("active_edition=fork")
                 if matched < self.rows.count {
                     self.banner = "检测输出不完整(\(matched)/\(self.rows.count))，请点重新检查"
                     self.phase = .failed
@@ -223,7 +225,7 @@ struct ContentView: View {
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text("Claude 账号切换器-fork").font(.title3.bold()).foregroundColor(.white)
-                Text("安全检查 · 切换 · 启动").font(.caption).foregroundColor(.white.opacity(0.55))
+                Text("共用 Claude 目录 · 账号库独立").font(.caption).foregroundColor(.white.opacity(0.55))
             }
             Spacer()
             Button {
@@ -340,7 +342,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity).padding(.vertical, 10)
             } else {
                 HStack(spacing: 6) {
-                    Text("当前账号").font(.caption).foregroundColor(.white.opacity(0.5))
+                    Text(vm.ownsActiveData ? "当前账号" : "上次使用").font(.caption).foregroundColor(.white.opacity(0.5))
                     Text(vm.current).font(.caption.bold())
                         .padding(.horizontal, 8).padding(.vertical, 3)
                         .background(Color.indigo.opacity(0.3)).foregroundColor(.indigo.opacity(1.4))
@@ -348,8 +350,8 @@ struct ContentView: View {
                     Spacer()
                 }
                 HStack(spacing: 10) {
-                    accountButton("A", subtitle: vm.current == "A" ? "当前" : "已建档")
-                    accountButton("B", subtitle: vm.current == "B" ? "当前" : (vm.hasB ? "已建档" : "未初始化"))
+                    accountButton("A", subtitle: vm.current == "A" ? (vm.ownsActiveData ? "当前" : "上次") : "已建档")
+                    accountButton("B", subtitle: vm.current == "B" ? (vm.ownsActiveData ? "当前" : "上次") : (vm.hasB ? "已建档" : "未初始化"))
                 }
             }
         }
@@ -529,7 +531,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !upstream.isEmpty {
             let alert = NSAlert()
             alert.messageText = "请先退出原版 Claude 切换器"
-            alert.informativeText = "两版账号数据独立,但系统代理和时区共用;请一次操作一个切换器。"
+            alert.informativeText = "两版共用 Claude 活动目录,账号库独立;请一次操作一个切换器。"
             alert.runModal()
             NSApplication.shared.terminate(nil)
         }

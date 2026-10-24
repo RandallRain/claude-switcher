@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 import shlex
 import subprocess
+import shutil
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -23,6 +25,10 @@ class WebRTCCommandTests(unittest.TestCase):
         self.folder = Path(self.temp.name)
         self.home, self.bin = self.folder / "home", self.folder / "bin"
         self.home.mkdir(); self.bin.mkdir()
+        self.sessions = self.home / '.claude-switcher-sessions'
+        self.sessions.mkdir(); (self.sessions / 'parked').mkdir()
+        (self.sessions / 'active-edition').write_text('upstream\n')
+        shutil.copyfile(ROOT / 'core/session-coordinator.py', self.sessions / 'session-coordinator.py')
         self.script = self.folder / "claude-switch-fork.sh"
         self.script.write_text(SCRIPT.read_text().replace(
             '/Library/Application Support/claude-switcher/tz-watchdog.sh',
@@ -37,7 +43,7 @@ class WebRTCCommandTests(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.defpath,
                         TEST_AUDIT=str(self.audit), TEST_LOADED=str(self.loaded),
                         TEST_CLAUDE=str(self.claude), TEST_EVENTS=str(self.events),
-                        TEST_LOAD_ON_OPEN="1")
+                        TEST_LOAD_ON_OPEN="1", CLAUDE_SWITCHER_COORDINATOR_PYTHON=sys.executable)
         self.write_tool("python3", r'''
 case "$1" in
   */stun-probe.py)
@@ -82,7 +88,7 @@ if [ -n "${TEST_FORK_PID:-}" ]; then
             if [ "$(/bin/cat "$TEST_CLAUDE")" = 1 ]; then
                 printf 'quit-claude\n' >> "$TEST_EVENTS"; printf 0 > "$TEST_CLAUDE"
             fi;;
-        *) printf '%s /Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=%s/Library/Application Support/Claude-fork\n' "$TEST_FORK_PID" "$HOME";;
+        *) printf '%s /Applications/Claude.app/Contents/MacOS/Claude\n' "$TEST_FORK_PID";;
     esac
 fi
 ''')
@@ -107,9 +113,9 @@ case "$*" in
 esac
 ''')
         self.write_tool("open", r'''
-if [ "$1" = -na ] && [ "$2" = /Applications/Claude.app ]; then
-    [ "$3" = --args ] && [ "$4" = "--user-data-dir=$HOME/Library/Application Support/Claude-fork" ] || exit 99
-    printf 'open-fork\n' >> "$TEST_EVENTS"; exit 0
+if [ "$1" = -a ] && [ "$2" = /Applications/Claude.app ]; then
+    [ "$#" = 2 ] || exit 99
+    printf 'open-default\n' >> "$TEST_EVENTS"; exit 0
 fi
 [ "$1" = -a ] && [ "$2" = 'Clash Verge' ] || exit 99
 printf 'open-verge\n' >> "$TEST_EVENTS"
@@ -174,6 +180,7 @@ exit 0
             dummy.wait(timeout=5)
         self.addCleanup(cleanup_dummy)
         self.env['TEST_FORK_PID'] = str(dummy.pid)
+        (self.sessions / 'active-edition').write_text('fork\n')
         self.claude.write_text("1")
         self.loaded.write_text("0")
         result = self.run_cli("fix")
@@ -249,7 +256,7 @@ exit 0
         base = self.home / ".claude-switcher-fork"
         base.mkdir()
         files = {"core/claude-switch.sh": body.encode()}
-        for name in ("stun-probe.py", "clash-rules.py", "clash-global-rules.js"):
+        for name in ("stun-probe.py", "clash-rules.py", "clash-global-rules.js", "session-coordinator.py"):
             files["core/" + name] = (ROOT / "core" / name).read_bytes()
         archive = self.folder / "remote.zip"
         with zipfile.ZipFile(archive, "w") as package:
@@ -275,7 +282,7 @@ esac
         self.write_tool("id", '[ "$1" = -u ] && printf "501\\n"\n')
         return installed, base, files
 
-    def test_fork_account_roundtrip_never_modifies_upstream_profile_or_state(self):
+    def test_shared_default_roundtrip_restores_upstream_profile_and_preserves_both_libraries(self):
         upstream = self.home / '.claude-switcher'
         (upstream / 'accounts/A').mkdir(parents=True)
         (upstream / 'current').write_text('B\n')
@@ -285,20 +292,22 @@ esac
         (original / 'sentinel').write_text('upstream active')
         base = self.home / '.claude-switcher-fork'
         base.mkdir(); (base / 'current').write_text('A\n')
-        data = self.home / 'Library/Application Support/Claude-fork'
+        data = self.sessions / 'parked/fork'
         data.mkdir(); (data / 'sentinel').write_text('fork active')
         for target in ('B', 'A'):
             result = self.run_cli('switch', args=(target,))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((original / 'sentinel').read_text(), 'fork active')
+        self.assertEqual(self.run_cli('release').returncode, 0)
         self.assertEqual((data / 'sentinel').read_text(), 'fork active')
         self.assertEqual((base / 'current').read_text().strip(), 'A')
         self.assertEqual((original / 'sentinel').read_text(), 'upstream active')
         self.assertEqual((upstream / 'current').read_text(), 'B\n')
         self.assertEqual((upstream / 'accounts/A/sentinel').read_text(), 'upstream archive')
-        self.assertEqual(self.events.read_text().splitlines(), ['open-fork', 'open-fork'])
+        self.assertEqual(self.events.read_text().splitlines(), ['open-default', 'open-default'])
 
     def test_wrong_country_blocks_switch_before_archiving_fork_profile(self):
-        data = self.home / 'Library/Application Support/Claude-fork'
+        data = self.home / 'Library/Application Support/Claude'
         data.mkdir(parents=True); (data / 'sentinel').write_text('retain')
         env = dict(self.env, TEST_EGRESS='fail:IPv4: 8.8.4.4 / JP')
         result = self.run_cli('switch', env, args=('B',))
@@ -307,13 +316,27 @@ esac
         self.assertFalse((self.home / '.claude-switcher-fork/current').exists())
         self.assertFalse(self.events.exists())
 
+    def test_missing_coordinator_makes_old_auto_updater_selfcheck_fail_closed(self):
+        (self.sessions / 'session-coordinator.py').unlink()
+        result = self.run_cli('checkdetail')
+        self.assertIn('保镖=fail:共享目录协调未就绪', result.stdout)
+        self.assertEqual(self.run_cli('check').returncode, 1)
+
+    def test_unmanaged_upstream_entry_blocks_shared_profile_startup(self):
+        backend = self.home / '.local/share/claude-switcher-upstream/claude-switch.sh'
+        backend.parent.mkdir(parents=True); backend.write_text('# saved upstream\n')
+        entry = self.home / '.local/bin/claude-switch.sh'
+        entry.parent.mkdir(parents=True); entry.write_text('# upstream installer replaced wrapper\n')
+        self.assertIn('保镖=fail:共享目录协调未就绪', self.run_cli('checkdetail').stdout)
+        self.assertEqual(self.run_cli('switch', args=('A',)).returncode, 1)
+
     def test_running_upstream_claude_blocks_global_mutations(self):
         env = dict(self.env, TEST_UPSTREAM_RUNNING='1')
         for command in ('fix', 'set-region', 'write-global-rules'):
             with self.subTest(command=command):
                 result = self.run_cli(command, env)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn('系统设置为 macOS 共用', result.stdout)
+                self.assertIn('另一个版本', result.stdout)
         self.assertFalse(self.events.exists())
 
     def test_update_preserves_local_configuration_and_all_upstream_files(self):
@@ -343,6 +366,31 @@ esac
         self.assertEqual(installed.read_bytes(), previous)
         self.assertFalse((base / 'stun-probe.py').exists())
 
+    def test_failed_update_restores_shared_coordinator_and_owner(self):
+        installed, base, _ = self.prepare_update()
+        coordinator = self.sessions / 'session-coordinator.py'
+        previous = coordinator.read_bytes() + b'\n# previous compatible coordinator\n'
+        coordinator.write_bytes(previous)
+        self.audit.write_text('fail:STUN无法验证\n')
+        result = subprocess.run(['/bin/bash', str(installed), 'update'], env=self.env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(coordinator.read_bytes(), previous)
+        self.assertEqual((self.sessions / 'active-edition').read_text(), 'upstream\n')
+
+    def test_previous_separate_directory_update_cannot_replace_shared_model(self):
+        installed, base, files = self.prepare_update()
+        previous = installed.read_bytes()
+        files['core/claude-switch.sh'] = files['core/claude-switch.sh'].replace(b'SESSION_MODEL="shared-default-v1"', b'# previous profile model')
+        with zipfile.ZipFile(self.env['TEST_ARCHIVE'], 'w') as archive:
+            for name, data in files.items(): archive.writestr('claude-switcher-main-fork/'+name, data)
+        Path(self.env['TEST_SUMS']).write_text(''.join(hashlib.sha256(data).hexdigest()+'  '+name+'\n' for name,data in files.items()))
+        result = subprocess.run(['/bin/bash', str(installed), 'update'], env=self.env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('共享目录版本', result.stdout)
+        self.assertEqual(installed.read_bytes(), previous)
+
     def test_upstream_edition_cannot_overwrite_fork_even_with_matching_checksums(self):
         installed, base, files = self.prepare_update()
         previous = installed.read_bytes()
@@ -365,12 +413,13 @@ esac
                 self.assertEqual(data['Label'], label)
                 self.assertIn('-fork', data['ProgramArguments'][1])
 
-    def test_bodyguard_only_targets_exact_fork_profile_for_this_user(self):
+    def test_bodyguard_targets_default_profile_only_while_fork_owns_it(self):
         guard = self.folder / 'bodyguard.sh'
         body = (ROOT / 'daemons/claude-bodyguard.sh').read_text()
         guard.write_text(body.replace('__HOME__', str(self.home)).replace('__USER_UID__','501')
                          .replace('__PROXY_MODE__','auto'))
         logs = self.home / 'Library/Logs'; logs.mkdir(parents=True)
+        (self.sessions / 'active-edition').write_text('fork\n')
         self.write_tool('ifconfig', 'exit 0\n')
         self.write_tool('ps', r'''
 printf '100 /Applications/Claude.app/Contents/MacOS/Claude\n'
@@ -381,7 +430,13 @@ printf '102 /Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=%s/Li
         result = subprocess.run(['/bin/bash','-c',command,'guard-test',str(guard)],env=self.env,
                                 capture_output=True,text=True,timeout=5)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(self.events.read_text().splitlines(),['-TERM 101'])
+        self.assertEqual(self.events.read_text().splitlines(),['-TERM 100'])
+        self.events.unlink()
+        (self.sessions / 'active-edition').write_text('upstream\n')
+        result = subprocess.run(['/bin/bash','-c',command,'guard-test',str(guard)],env=self.env,
+                                capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse(self.events.exists(), 'fork guard closed upstream-owned Claude')
 
     def test_helper_only_update_is_not_skipped_and_distributes_all_artifacts(self):
         installed, base, files = self.prepare_update()
@@ -393,7 +448,7 @@ printf '102 /Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=%s/Li
         self.assertIn("更新完成", result.stdout)
         for path, data in files.items():
             if path != "core/claude-switch.sh":
-                self.assertEqual((base / Path(path).name).read_bytes(), data)
+                self.assertEqual(((self.sessions if path.endswith("session-coordinator.py") else base) / Path(path).name).read_bytes(), data)
 
     def test_failed_update_restores_core_and_helpers_and_removes_new_artifacts(self):
         installed, base, _ = self.prepare_update("\n# installed previous version\n")

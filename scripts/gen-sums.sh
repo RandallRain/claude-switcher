@@ -7,6 +7,8 @@ shasum -a 256 \
     core/stun-probe.py \
     core/clash-rules.py \
     core/clash-global-rules.js \
+    core/session-coordinator.py \
+    core/upstream-launcher.sh \
     daemons/claude-bodyguard.sh \
     daemons/tz-watchdog.sh \
     daemons/local.claude-bodyguard.plist \

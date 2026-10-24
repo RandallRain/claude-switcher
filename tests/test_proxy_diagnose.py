@@ -64,6 +64,7 @@ esac
                                 capture_output=True, text=True, timeout=20)
         self.assertFalse((self.home / ".claude-switcher").exists(), "diagnostic created upstream state")
         self.assertFalse((self.home / ".claude-switcher-fork").exists(), "diagnostic created fork state")
+        self.assertFalse((self.home / ".claude-switcher-sessions").exists(), "diagnostic created shared state")
         self.assertFalse((self.folder / "unexpected-system-call").exists(), "diagnostic touched system tools")
         return result, json.loads(result.stdout)
 
@@ -89,7 +90,7 @@ esac
         result = subprocess.run(["/bin/bash", str(SCRIPT), "status"], env=self.env,
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "current=none hasA=0 hasB=0")
+        self.assertEqual(result.stdout.strip(), "current=none hasA=0 hasB=0 active_edition=unknown")
         self.assertTrue((self.home / ".claude-switcher-fork/accounts").is_dir())
 
     def test_private_config_and_credentials_do_not_enter_output_or_argv(self):

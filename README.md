@@ -21,24 +21,29 @@
 
 ## 个人版与上游版共存
 
-本分支为个人版,桌面名称为 **Claude切换器-fork**,App 标识为 `local.claude-switcher-fork`。原项目见 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)。
+本分支为个人版,桌面名称为 **Claude切换器-fork**,App 标识为 `local.claude-switcher-fork`。原项目见 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)。两版轮流使用默认 Claude 活动目录,账号库、后台服务、缓存和日志分别管理。
 
 | 项目 | 上游版 | fork 版 |
 |---|---|---|
-| 核心 | `~/.local/bin/claude-switch.sh` | `~/.local/bin/claude-switch-fork.sh` |
+| 核心入口 | `~/.local/bin/claude-switch.sh` (协调转发器) | `~/.local/bin/claude-switch-fork.sh` |
 | 状态、账号库、探针、缓存 | `~/.claude-switcher/` | `~/.claude-switcher-fork/` |
-| Claude 活动数据 | `~/Library/Application Support/Claude/` | `~/Library/Application Support/Claude-fork/` |
+| Claude 活动数据 | `~/Library/Application Support/Claude/` | 同一个默认目录 |
+| 不活跃时的现场 | `~/.claude-switcher-sessions/parked/upstream/` | `~/.claude-switcher-sessions/parked/fork/` |
 | root 守护脚本 | `/Library/Application Support/claude-switcher/` | `/Library/Application Support/claude-switcher-fork/` |
 | 后台 Label | `local.claude-bodyguard` / `local.tz-watchdog` / `local.claude-update` | 对应名称均添加 `-fork` |
 | 更新源 | `YOURSJEYO/claude-switcher:main` | `RandallRain/claude-switcher:main-fork` |
 
-fork 版通过 `open -na /Applications/Claude.app --args --user-data-dir=.../Claude-fork` 使用独立 Claude 数据目录。首次使用需要重新登录,不会复制或迁移原版的账号/凭据。切换和保镖关闭进程时按专用目录识别 fork Claude,不向所有 Claude 实例发送退出命令。两版仍使用同一个系统安装的 Claude 二进制和 macOS 用户 Keychain,这不是操作系统安全沙箱;Claude 更新后须重新验证独立目录兼容性。
+个人版正常启动 `/Applications/Claude.app`,不传 `--user-data-dir`。两版不能同时占用活动目录。公共协调器以 `active-edition` 标记归属,选择另一版账号时先安检、完全退出 Claude,保存当前活动现场,再恢复目标版现场。之后才从目标版自己的 A/B 库切换。保存的是最新活动现场,不会用旧账号快照覆盖刚产生的登录状态。两版的 accounts/ 和 current 保持原结构。
 
-两个切换器请依次使用。时区、用户 Locale、IPv6、DNS 和同一个代理客户端/TUN 属于共享系统资源,不能靠两个 App 名称隔离。fork 的修复/地区切换/规则写入在原版 Claude 或原版切换器活跃时会中止;时区看门狗只在 fork 活跃时工作,检测到原版目标冲突时不改系统时区。原版自身的关闭/修复逻辑可能影响其他 Claude 实例,完整隔离需独立 macOS 虚拟机。
+首次升级会将旧 `Claude-fork/` 活动数据移动到个人版暂存现场,不会删除或重新初始化已有登录资料。切到个人版后,这份数据恢复到默认目录。`~/.local/bin/claude-switch-fork.sh release` 可退出 Claude 并将原版现场交还默认目录,不自动启动原版。直接从 Dock 打开 Claude 会使用当前 active-edition 的现场;需要切换版本时请使用对应切换器入口。
 
-Clash 规则使用独立 `claude-switcher-fork` 标记,保留已有原版和用户脚本;实际路由仍影响共享代理的流量。安装/卸载 fork 不移除原版程序、服务或账号,也不自动撤销系统网络设置。
+上游功能源码保存在 `~/.local/share/claude-switcher-upstream/claude-switch.sh`,原版入口只增加共享目录协调。其自动更新仍来自上游 main,写入这个后端路径,保留协调入口。重新运行上游安装器会覆盖协调入口,之后须重跑个人版安装器恢复共存支持。个人版卸载先交还原版现场,保留公共协调组件与两版账号数据。
 
-自动更新每 12 小时由用户态 `local.claude-update-fork` 运行,日志写入 `~/.claude-switcher-fork/update.log`。校验工件并验证 fork 更新源标记后才覆盖个人版,保留五项本机配置;自检失败整组回滚。root 守护脚本与桌面 UI 有变化时需重新运行个人版安装器。仅更新脚本不会重编译 UI。
+切换、修复、更新等操作共用跨版本锁,个人版还保留内部操作锁。交接使用 rename 和事务记录;失败时回滚,中断时保留所有现场及 transfer.json 并拒绝继续覆盖。不要手动删除暂存现场或事务记录,也不要直接调用上游后端绕过协调器。
+
+时区、用户 Locale、IPv6、DNS、系统 Keychain 和代理客户端/TUN 仍是共享资源。个人版的保镖/看门狗仅在默认目录归 fork 持有时工作,目标时区冲突时不互相改写。上游保镖保护同一个 Claude 程序。Clash 规则使用独立 fork 标记并保留已有脚本,实际路由仍影响共享代理的流量。
+
+自动更新每 12 小时由用户态 `local.claude-update-fork` 运行,日志在 `~/.claude-switcher-fork/update.log`。校验工件与共享目录版本标记后覆盖个人版核心、辅助文件和公共协调器,保留五项本机配置,自检失败整组回滚。root 守护脚本与 UI 变更须重跑个人版安装器。仅更新脚本不会重编译 UI。
 
 ## 为什么做这个
 

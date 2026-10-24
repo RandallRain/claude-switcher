@@ -1,6 +1,6 @@
 #!/bin/bash
 # Claude 账号切换器-fork - 核心脚本
-# 用法: claude-switch-fork.sh check | status | switch A|B | checkdetail | fix | set-region | update [--auto] | diagnose-proxy
+# 用法: claude-switch-fork.sh check | status | switch A|B | release | checkdetail | fix | set-region | update [--auto] | diagnose-proxy
 set -u
 export LC_ALL=en_US.UTF-8
 # 检测输出含用于本机 UI 的地址,缓存和历史记录只允许当前用户读取。
@@ -153,10 +153,12 @@ LOCALE_TARGET="en_US"          # 锁定地区格式
 EDITION="fork"
 UPDATE_REPO="RandallRain/claude-switcher"
 UPDATE_BRANCH="main-fork"
-DATA="$HOME/Library/Application Support/Claude-fork"
-# 个人版的活动数据、账号存档、探针、缓存和更新均独立。
+SESSION_MODEL="shared-default-v1"
+DATA="$HOME/Library/Application Support/Claude"
+# 活动目录共用;账号存档/缓存独立,由公共协调器交接活动现场。
 BASE="$HOME/.claude-switcher-fork"
 STATE_BASE="$BASE"
+SESSION_ROOT="$HOME/.claude-switcher-sessions"
 LOG="$HOME/Library/Logs/claude-switch-fork.log"
 CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 ROUTE_MISSED=""
@@ -176,23 +178,37 @@ acquire_operation_lock() {
     trap 'exit 143' TERM
 }
 
-# fork 包含带专用目录的辅助进程,保证交换数据前完全退出;原版只识别主进程。
+# 共用默认目录后必须完全退出使用默认目录的主进程及辅助进程。
 claude_pids() {
     ps -ww -U "$(id -u)" -o pid=,command= | awk -v app='/Applications/Claude.app/Contents/MacOS/Claude' \
         -v root='/Applications/Claude.app/Contents/' \
-        -v flag="--user-data-dir=$DATA" -v edition="${1:-fork}" '
+        -v flag="--user-data-dir=$DATA" '
         {pid=$1; sub(/^[ \t]*[0-9]+[ \t]+/, "")}
         index($0,root)==1 {
             pos=index($0,flag); nextchar=substr($0,pos+length(flag),1)
-            own=pos>0 && (nextchar=="" || nextchar==" ")
-            if ((edition=="fork" && own) || (edition=="upstream" && !own && index($0,app)==1 && index($0,"--type=")==0)) print pid
+            own=index($0,"--user-data-dir=")==0 || (pos>0 && (nextchar=="" || nextchar==" "))
+            if (own) print pid
         }'
 }
 
 require_exclusive_system() {
-    if [ -n "$(claude_pids upstream)" ] || pgrep -x ClaudeSwitcher >/dev/null 2>&1; then
+    local owner=""
+    [ ! -f "$SESSION_ROOT/active-edition" ] || owner=$(cat "$SESSION_ROOT/active-edition")
+    if pgrep -x ClaudeSwitcher >/dev/null 2>&1 || { [ "$owner" != fork ] && [ -n "$(claude_pids)" ]; }; then
         echo "FAIL:系统设置为 macOS 共用,请先退出原版切换器及原版 Claude"
         return 1
+    fi
+}
+
+session_ready() {
+    [ -f "$SESSION_ROOT/session-coordinator.py" ] && \
+    [ -f "$SESSION_ROOT/active-edition" ] && \
+    [ ! -e "$SESSION_ROOT/transfer.json" ] && \
+    [ ! -e "$HOME/Library/Application Support/Claude-fork" ] || return 1
+    case "$(cat "$SESSION_ROOT/active-edition")" in upstream|fork) ;; *) return 1;; esac
+    # 上游安装器覆盖入口后须先恢复协调层,不能继续无保护共用目录。
+    if [ -f "$HOME/.local/share/claude-switcher-upstream/claude-switch.sh" ]; then
+        grep -q 'session-coordinator.py.*run upstream' "$HOME/.local/bin/claude-switch.sh" || return 1
     fi
 }
 
@@ -351,6 +367,7 @@ check() {
     esac
 
     launchctl print system/local.claude-bodyguard-fork >/dev/null 2>&1 || fails="$fails;保镖未运行"
+    session_ready || fails="$fails;共享目录协调未就绪,请运行fork安装器"
 
     # 兼容升级前的规则;WebRTC 仍须核验实际 UDP 代理策略,全局脚本未核验时界面提示修复。
     if [ "$PROXY_MODE" = "clash-verge" ]; then
@@ -457,7 +474,9 @@ checkdetail() {
         ok:*|warn:*|fail:*) echo "WebRTC=$wr" ;;
         *) echo 'WebRTC=fail:检测异常(请更新探针)' ;;
     esac
-    if launchctl print system/local.claude-bodyguard-fork >/dev/null 2>&1; then
+    if ! session_ready; then
+        echo '保镖=fail:共享目录协调未就绪,请运行fork安装器'
+    elif launchctl print system/local.claude-bodyguard-fork >/dev/null 2>&1; then
         lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard-fork.log" 2>/dev/null | cut -c1-40)
         echo "保镖=ok:${lastkill:-待命}"
     else
@@ -757,25 +776,30 @@ self_update() {
         echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
     fi
 
-    # 四个实际部署工件必须全部列入清单;拒绝误发布的原版或旧版包。
-    for artifact in core/claude-switch.sh core/stun-probe.py core/clash-rules.py core/clash-global-rules.js; do
+    # 五个实际部署工件必须全部列入清单;拒绝误发布的原版或旧版包。
+    for artifact in core/claude-switch.sh core/stun-probe.py core/clash-rules.py core/clash-global-rules.js core/session-coordinator.py; do
         if ! awk -v path="$artifact" '$2 == path && length($1) == 64 {found=1} END {exit !found}' "$tmpd/SHA256SUMS"; then
             echo "FAIL:校验清单缺少必要工件,已中止"; rm -rf "$tmpd"; return 1
         fi
     done
     if ! grep -qx 'EDITION="fork"' "$NEW/core/claude-switch.sh" || \
        ! grep -qx 'UPDATE_REPO="RandallRain/claude-switcher"' "$NEW/core/claude-switch.sh" || \
-       ! grep -qx 'UPDATE_BRANCH="main-fork"' "$NEW/core/claude-switch.sh"; then
-        echo "FAIL:更新包不是 fork/main-fork 版本,已中止"; rm -rf "$tmpd"; return 1
+       ! grep -qx 'UPDATE_BRANCH="main-fork"' "$NEW/core/claude-switch.sh" || \
+       ! grep -qx 'SESSION_MODEL="shared-default-v1"' "$NEW/core/claude-switch.sh"; then
+        echo "FAIL:更新包不是 fork/main-fork 共享目录版本,已中止"; rm -rf "$tmpd"; return 1
     fi
 
     # 跳过判断同时比较辅助工件;探针/全局脚本单独更新也必须分发。
     strip_cfg() { grep -vE '^(PROXY_MODE|PROXY_GROUP|COUNTRY_TARGET|TZ_TARGET|LOCALE_TARGET)="' "$1"; }
     UPDATE_BASE="$UHOME/.claude-switcher-fork"
     CORE_PATH="$BIN/claude-switch-fork.sh"
+    update_destination() {
+        if [ "$1" = session-coordinator.py ]; then printf '%s\n' "$SESSION_ROOT/$1"
+        else printf '%s\n' "$UPDATE_BASE/$1"; fi
+    }
     helpers_changed=0
-    for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
-        cmp -s "$UPDATE_BASE/$helper" "$NEW/core/$helper" || helpers_changed=1
+    for helper in stun-probe.py clash-rules.py clash-global-rules.js session-coordinator.py; do
+        cmp -s "$(update_destination "$helper")" "$NEW/core/$helper" || helpers_changed=1
     done
     if [ "$helpers_changed" -eq 0 ] && [ -f "$CORE_PATH" ] && \
        diff <(strip_cfg "$CORE_PATH") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
@@ -786,30 +810,30 @@ self_update() {
     if [ -f "$CORE_PATH" ] && ! cp "$CORE_PATH" "$CORE_PATH.bak"; then
         echo "FAIL:核心脚本备份失败,未执行更新"; rm -rf "$tmpd"; return 1
     fi
-    mkdir -p "$UPDATE_BASE" "$tmpd/helper-backups"
+    mkdir -p "$UPDATE_BASE" "$SESSION_ROOT" "$tmpd/helper-backups"
     restore_update_helpers() {
-        for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
+        for helper in stun-probe.py clash-rules.py clash-global-rules.js session-coordinator.py; do
             if [ -f "$tmpd/helper-backups/$helper" ]; then
-                cp "$tmpd/helper-backups/$helper" "$UPDATE_BASE/$helper"
+                cp "$tmpd/helper-backups/$helper" "$(update_destination "$helper")"
             else
-                rm -f "$UPDATE_BASE/$helper"
+                rm -f "$(update_destination "$helper")"
             fi
         done
     }
-    for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
-        if [ -f "$UPDATE_BASE/$helper" ] && ! cp "$UPDATE_BASE/$helper" "$tmpd/helper-backups/$helper"; then
+    for helper in stun-probe.py clash-rules.py clash-global-rules.js session-coordinator.py; do
+        if [ -f "$(update_destination "$helper")" ] && ! cp "$(update_destination "$helper")" "$tmpd/helper-backups/$helper"; then
             echo "FAIL:辅助工件备份失败,未执行更新"; rm -rf "$tmpd"; return 1
         fi
     done
-    for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
-        if ! cp "$NEW/core/$helper" "$UPDATE_BASE/$helper"; then
+    for helper in stun-probe.py clash-rules.py clash-global-rules.js session-coordinator.py; do
+        if ! cp "$NEW/core/$helper" "$(update_destination "$helper")"; then
             restore_update_helpers
             echo "FAIL:辅助工件更新失败,已回滚"; rm -rf "$tmpd"; return 1
         fi
     done
     if [ "$(id -u)" -eq 0 ]; then
         owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
-        [ -n "$owner" ] && chown "$owner" "$UPDATE_BASE/stun-probe.py" "$UPDATE_BASE/clash-rules.py" "$UPDATE_BASE/clash-global-rules.js"
+        [ -n "$owner" ] && chown "$owner" "$UPDATE_BASE/stun-probe.py" "$UPDATE_BASE/clash-rules.py" "$UPDATE_BASE/clash-global-rules.js" "$SESSION_ROOT/session-coordinator.py"
     fi
 
     # 替换核心脚本 + 从 .bak 读出5个配置值注入新脚本
@@ -906,14 +930,16 @@ status() {
     cur="none"; [ -f "$STATE_BASE/current" ] && cur=$(cat "$STATE_BASE/current")
     hasA=0; [ -d "$STATE_BASE/accounts/A" ] && hasA=1
     hasB=0; [ -d "$STATE_BASE/accounts/B" ] && hasB=1
-    echo "current=$cur hasA=$hasA hasB=$hasB"
+    active="unknown"; [ ! -f "$SESSION_ROOT/active-edition" ] || active=$(cat "$SESSION_ROOT/active-edition")
+    case "$active" in upstream|fork) ;; *) active=unknown;; esac
+    echo "current=$cur hasA=$hasA hasB=$hasB active_edition=$active"
 }
 
 quit_claude() {
     local pids
     pids=$(claude_pids)
     [ -n "$pids" ] || return 0
-    # 按进程 ID 关闭本版实例;不向共享 bundle ID 发送会影响原版的 quit。
+    # 共享目录只允许一个版本持有;协调器已确认所有权,按 PID 完全退出。
     for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
     for i in $(seq 1 15); do
         [ -n "$(claude_pids)" ] || return 0
@@ -923,7 +949,7 @@ quit_claude() {
 }
 
 launch_claude() {
-    open -na /Applications/Claude.app --args "--user-data-dir=$DATA"
+    open -a /Applications/Claude.app
 }
 
 archive_current() {
@@ -1043,6 +1069,15 @@ switch_to() {
     return 0
 }
 
+# 上游入口也经过同一个协调器,公共锁跨两版生效。只读检查不交接活动数据。
+case "${1:-}" in
+    switch|fix|set-region|update|write-global-rules|write-merge-rules|release)
+        if [ "${CLAUDE_SWITCHER_SESSION_INTERNAL:-0}" != 1 ]; then
+            exec "${CLAUDE_SWITCHER_COORDINATOR_PYTHON:-python3}" \
+                "$SESSION_ROOT/session-coordinator.py" run fork "$0" "$@"
+        fi ;;
+esac
+
 case "${1:-}" in
     check)  check ;;
     checkdetail)
@@ -1062,5 +1097,5 @@ case "${1:-}" in
     update) acquire_operation_lock && self_update "${2:-}" ;;
     write-global-rules|write-merge-rules) acquire_operation_lock && require_exclusive_system && write_global_rules ;;  # 旧入口仅作兼容,统一写全局脚本
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch-fork.sh check|checkdetail|fix|status|switch A|B|set-region|update [--auto]|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch-fork.sh check|checkdetail|fix|status|switch A|B|release|set-region|update [--auto]|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac

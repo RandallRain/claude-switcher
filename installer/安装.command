@@ -5,6 +5,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 H="$HOME"
 CORE="$H/.local/bin/claude-switch-fork.sh"
 BASE="$H/.claude-switcher-fork"
+SESSION_ROOT="$H/.claude-switcher-sessions"
 APP="$H/Desktop/Claude切换器-fork.app"
 SYSTEM_DIR="/Library/Application Support/claude-switcher-fork"
 echo "Claude 账号切换器-fork · 安装程序"
@@ -21,6 +22,9 @@ case "$CTRY" in ''|CN) echo "出口国家未取得或为 CN,请先配置代理";
 # 升级沿用个人版配置;首次只读取旧安装的五项非账号配置。
 CONFIG="$CORE"
 [ -f "$CONFIG" ] || CONFIG="$H/.local/bin/claude-switch.sh"
+if [ ! -f "$CORE" ] && [ -f "$H/.local/share/claude-switcher-upstream/claude-switch.sh" ]; then
+    CONFIG="$H/.local/share/claude-switcher-upstream/claude-switch.sh"
+fi
 get_cfg() { if [ -f "$CONFIG" ]; then sed -n "s/^$1=\"\([^\"]*\)\".*/\1/p" "$CONFIG" | head -1; fi; }
 CLASH_DIR="$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 MODE=$(get_cfg PROXY_MODE)
@@ -125,11 +129,30 @@ echo "fork 独立系统服务已安装"
 
 mkdir -p "$H/.local/bin" "$BASE" "$H/Desktop" "$H/Library/LaunchAgents" "$H/Library/Logs"
 pkill -x ClaudeSwitcher-fork 2>/dev/null || true
+pkill -x ClaudeSwitcher 2>/dev/null || true
 [ ! -f "$CORE" ] || cp -p "$CORE" "$CORE.bak"
 install -m 755 "$STAGE/claude-switch-fork.sh" "$CORE"
 for helper in stun-probe.py clash-rules.py clash-global-rules.js; do
     install -m 600 "$REPO/core/$helper" "$BASE/$helper"
 done
+# 共用活动目录的协调器不放在任一版账号库中。
+mkdir -p "$SESSION_ROOT"
+chmod 700 "$SESSION_ROOT"
+install -m 600 "$REPO/core/session-coordinator.py" "$SESSION_ROOT/session-coordinator.py"
+UPSTREAM_BACKEND="$H/.local/share/claude-switcher-upstream/claude-switch.sh"
+UPSTREAM_ENTRY="$H/.local/bin/claude-switch.sh"
+if [ -f "$UPSTREAM_ENTRY" ]; then
+    if ! grep -q 'session-coordinator.py.*run upstream' "$UPSTREAM_ENTRY"; then
+        mkdir -p "$(dirname "$UPSTREAM_BACKEND")"
+        cp -p "$UPSTREAM_ENTRY" "$UPSTREAM_BACKEND.new"
+        mv "$UPSTREAM_BACKEND.new" "$UPSTREAM_BACKEND"
+    fi
+    [ -f "$UPSTREAM_BACKEND" ] || { echo "原版后端缺失,未覆盖原版入口"; exit 1; }
+    install -m 755 "$REPO/core/upstream-launcher.sh" "$UPSTREAM_ENTRY.new"
+    mv "$UPSTREAM_ENTRY.new" "$UPSTREAM_ENTRY"
+fi
+# 完全退出 Claude 后迁移旧的个人版活动现场;两个 accounts/ 均不改动。
+python3 "$SESSION_ROOT/session-coordinator.py" prepare
 if [ -d "$APP" ]; then
     rm -rf "$APP.bak"
     mv "$APP" "$APP.bak"
@@ -163,4 +186,4 @@ printf '%s\n' "$DETAILS" | awk -F= '/^[^#=]+=(ok|warn|fail)(:|$)/ {split($2,a,":
 if [ "$(printf '%s\n' "$DETAILS" | grep -Ec '^[^#=]+=ok(:|$)')" -ne 14 ]; then
     echo "fork 已安装,部分安检为警告或失败,请打开桌面 App 查看详情"; exit 1
 fi
-echo "安装完成: 双击桌面 Claude切换器-fork;新环境需要独立登录"
+echo "安装完成: 两版共用默认 Claude 目录,选择账号时自动交接各自现场"

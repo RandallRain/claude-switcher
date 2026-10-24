@@ -4,9 +4,11 @@
 TARGET="__TZ_TARGET__"
 LOG="__HOME__/Library/Logs/tz-watchdog-fork.log"
 
-# 个人版未运行时不持续改变系统时区,减少对原版的影响。
+# 只在共享默认目录归 fork 且个人版正在使用时维护时区。
+owner=$(cat "__HOME__/.claude-switcher-sessions/active-edition" 2>/dev/null)
+[ "$owner" = fork ] || exit 0
 if ! pgrep -U "__USER_UID__" -x ClaudeSwitcher-fork >/dev/null 2>&1; then
-    ps -ww -U "__USER_UID__" -o command= | grep -F -- '--user-data-dir=__HOME__/Library/Application Support/Claude-fork' >/dev/null || exit 0
+    pgrep -U "__USER_UID__" -f '^/Applications/Claude.app/Contents/MacOS/Claude($| )' >/dev/null 2>&1 || exit 0
 fi
 # 原版看门狗也在运行且目标冲突时拒绝互相改写。
 other='/Library/Application Support/claude-switcher/tz-watchdog.sh'

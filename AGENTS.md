@@ -7,13 +7,17 @@
 
 ## 本分支的 macOS fork 身份
 
-本分支个人版 App 名称为 `Claude切换器-fork.app`,核心安装为 `~/.local/bin/claude-switch-fork.sh`,运行状态/账号库为 `~/.claude-switcher-fork/`,活动 Claude 数据为 `~/Library/Application Support/Claude-fork/`。必须通过 `open -na /Applications/Claude.app --args --user-data-dir=.../Claude-fork` 启动个人版 Claude,不可回退到原版默认数据目录。
+本分支个人版 App 名称为 `Claude切换器-fork.app`,核心安装为 `~/.local/bin/claude-switch-fork.sh`,运行状态/账号库为 `~/.claude-switcher-fork/`。两版 Claude 活动数据统一为 `~/Library/Application Support/Claude/`,不传入 `--user-data-dir`,不再启动旧 `Claude-fork` 目录。
 
-三个服务的安装 Label 和 plist 文件名分别为 `local.claude-bodyguard-fork`、`local.tz-watchdog-fork`、`local.claude-update-fork`;仓库中的三个 plist 模板仍保留原文件名。root 守护脚本只安装于 `/Library/Application Support/claude-switcher-fork/`,脚本必须为 root:wheel、755。更新源固定为 `RandallRain/claude-switcher` 的 `main-fork`,绝不能从上游 main 覆盖个人版。
+两版的账号库和 current 仍独立。所有账号切换必须经过 `~/.claude-switcher-sessions/session-coordinator.py`。公共 `active-edition` 标记默认目录的所有者;切换版本时先安检并完全退出 Claude,再把原活动现场移动到 `parked/<版本>/`,恢复目标现场到默认目录,最后调用该版账号切换。公共锁跨两版生效;发现 `transfer.json` 说明交接中断,须保留现场并先恢复,不得猜测/删除。
 
-两版账号库和 current 独立,不得读取/迁移/改写原版 `~/.claude-switcher/accounts/` 的存档结构。原版脚本/App/服务也不得由个人版安装器或卸载器覆盖。首次个人版账号应独立登录,不要复制原版凭据。保镖/账号切换仅关闭带个人版专用 user-data-dir 的 Claude 实例。
+安装器将原版核心保存于 `~/.local/share/claude-switcher-upstream/claude-switch.sh`,在原版 `~/.local/bin/claude-switch.sh` 放协调转发入口。只允许封装入口,不得篡改原版后端的功能代码或账号存档。原版自更新写入后端位置,不得覆盖协调入口。上游安装器若重新覆盖入口,须重跑个人版安装器恢复协调层。
 
-macOS 时区、Locale、IPv6、代理 TUN 和系统 Keychain 无法按 App 名称隔离。不得宣称完全隔离;修改共享设置时必须检查原版活跃状态和看门狗目标冲突。fork 看门狗只在 fork 活跃时工作。完整隔离需独立操作系统。
+旧个人版活动目录 `~/Library/Application Support/Claude-fork/` 仅在安装迁移时完全退出 Claude 后移动到 `~/.claude-switcher-sessions/parked/fork/`,两个 accounts/ 均不迁移。`claude-switch-fork.sh release` 交还原版活动现场且不启动 Claude;卸载个人版必须先交还,保留协调组件、两版账号库与暂存现场。
+
+三个服务的安装 Label 和 plist 文件名分别为 `local.claude-bodyguard-fork`、`local.tz-watchdog-fork`、`local.claude-update-fork`;仓库三个 plist 模板仍保留原文件名。root 脚本只安装于 `/Library/Application Support/claude-switcher-fork/`,必须为 root:wheel、755。保镖和看门狗仅在 active-edition 为 fork 时保护共享默认目录,后台不交换数据。更新源固定为 `RandallRain/claude-switcher:main-fork`,更新须同步并校验公共协调器,拒绝回退到旧的独立活动目录版本。
+
+macOS 时区、Locale、IPv6、代理 TUN 和系统 Keychain 仍共享。修改共享设置时检查原版活跃状态和看门狗目标冲突;两个切换器轮流使用。绝不能绕过协调器分别交换同一个活动目录,也不要改变任何 accounts/ 内的存档结构。
 
 ## 你的任务
 
@@ -33,6 +37,8 @@ macOS 时区、Locale、IPv6、代理 TUN 和系统 Keychain 无法按 App 名�
 
 首选引导用户运行安装器（双击 `installer/安装.command`，或终端执行它）。如果安装器环境受限，按下面的手动等效步骤执行：
 
+共享活动目录版本的手动安装还必须安装公共协调器、封装原版入口并执行 `prepare` (参见本文件开头和安装器用户态步骤);不能只复制旧版四个核心工件,也不得直接调用上游后端切换账号。
+
 1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch-fork.sh`（可执行），把 `core/stun-probe.py`、`core/clash-rules.py`、`core/clash-global-rules.js` 放到 `~/.claude-switcher-fork/`
 2. 探测代理客户端并写进脚本顶部 `PROXY_MODE="..."`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/shadowrocket/sing-box/clashx/surge/auto 中选择
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名写进 `PROXY_GROUP="..."`（其他客户端跳过）
@@ -51,7 +57,7 @@ macOS 的 `check`、`checkdetail` 和 `fix` 共用一轮双栈出口/STUN 快照
 
 WebRTC 按是否观测到非代理 IP 判色：同版本匹配、部分或全部探针无结果均为绿色，UI 必须说明已匹配的地址族及未取得结果的范围；全部无结果要注明 UDP 出口未验证，不得写成已确认“UDP 不出网、零暴露”。地址不匹配、响应格式异常、探针执行异常、有效地址缺少同版本参考或代理策略无法核验仍为红色。
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher-fork/update.log`；手动跑则直接打印。流程：拉取个人仓库 main-fork → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行并连同辅助工件比对去重 → 备份核心与探针/全局规则工件 → 注入配置并同步辅助文件 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 整组回滚）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher-fork/update.log`；手动跑则直接打印。流程：拉取个人仓库 main-fork → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行并连同辅助工件比对去重 → 备份核心与探针/全局规则/公共协调器工件 → 注入配置并同步辅助文件 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 整组回滚）
 
 ## 独立代理诊断
 
@@ -83,7 +89,7 @@ WebRTC 按是否观测到非代理 IP 判色：同版本匹配、部分或全部
 ## 安全红线（Agent 必须遵守）
 
 1. **绝不在出口国家与目标不一致时启动 Claude**——任何时候先验 cloudflare trace 的 `loc` 与脚本头部 `COUNTRY_TARGET` 一致；换了国家节点先跑 `claude-switch.sh set-region` 再启动
-2. 切换账号前必须先完全退出 fork Claude 进程，再交换数据目录
+2. 切换账号前必须经公共协调器确认所有权,并完全退出使用默认目录的 Claude 进程，再交换数据目录
 3. 不要在日志、文档、Issue 里暴露用户的住宅/代理 IP 与任何凭据
 4. 不要改动 `~/.claude-switcher-fork/accounts/` 下的存档结构
 5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——自动更新靠它校验工件完整性，清单与代码不一致会导致所有用户更新失败

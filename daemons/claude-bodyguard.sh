@@ -4,6 +4,10 @@
 LOG="__HOME__/Library/Logs/claude-bodyguard-fork.log"
 MODE="__PROXY_MODE__"
 
+# 共享默认目录的所有者由用户态协调器切换;后台不交换数据。
+owner=$(cat "__HOME__/.claude-switcher-sessions/active-edition" 2>/dev/null)
+[ "$owner" = fork ] || exit 0
+
 ok=1
 
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管
@@ -32,14 +36,14 @@ case "$MODE" in
 esac
 
 if [ "$ok" -eq 0 ]; then
-    # 只终止带 fork 专用 user-data-dir 的本用户 Claude 主进程。
+    # 仅在默认目录归 fork 持有时,终止本用户使用默认目录的 Claude 主进程。
     pids=$(ps -ww -U "__USER_UID__" -o pid=,command= | awk \
         -v app='/Applications/Claude.app/Contents/MacOS/Claude' \
-        -v flag='--user-data-dir=__HOME__/Library/Application Support/Claude-fork' '
+        -v flag='--user-data-dir=__HOME__/Library/Application Support/Claude' '
         {pid=$1; sub(/^[ \t]*[0-9]+[ \t]+/, "")}
         index($0,app)==1 && index($0,"--type=")==0 {
             pos=index($0,flag); nextchar=substr($0,pos+length(flag),1)
-            if (pos>0 && (nextchar=="" || nextchar==" ")) print pid
+            if (index($0,"--user-data-dir=")==0 || (pos>0 && (nextchar=="" || nextchar==" "))) print pid
         }')
     if [ -n "$pids" ]; then
         for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
