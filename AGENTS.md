@@ -37,6 +37,8 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
+macOS 的 `check`、`checkdetail` 和 `fix` 共用一轮双栈出口/STUN 快照。出口 IP 在 UI 分别显示 IPv4、IPv6 及国家，单个地址族未获取会明确标注；任一观测出口国家异常或全部未获取均失败。时区、地区项显示实际系统时区与 Locale（包含地区名称），不是仅显示目标值。真实地址只用于本机 UI/私有缓存，不要复制到日志或交接输出。
+
 日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `update [--auto]`（自动更新：`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 剔除 5 个配置行并连同辅助工件比对去重 → 备份核心与探针/全局规则工件 → 注入配置并同步辅助文件 → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 整组回滚）
 
 ## 独立代理诊断

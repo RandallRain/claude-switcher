@@ -11,6 +11,27 @@ struct CheckRow: Identifiable {
     let icon: String
     var state: RowState = .pending
     var detail: String = ""
+
+    var displayDetail: String {
+        let names = Locale(identifier: "zh_CN")
+        if name == "出口 IP" {
+            return detail.components(separatedBy: " | ").map { line in
+                let parts = line.components(separatedBy: " / ")
+                guard parts.count == 2, parts[1].count == 2 else { return line }
+                let code = parts[1]
+                let country = names.localizedString(forRegionCode: code) ?? code
+                return "\(parts[0]) · \(country) (\(code))"
+            }.joined(separator: "\n")
+        }
+        if name == "地区" {
+            let identifier = detail.components(separatedBy: " ").first ?? ""
+            if let code = Locale(identifier: identifier).region?.identifier,
+               let country = names.localizedString(forRegionCode: code) {
+                return "\(country) · \(detail)"
+            }
+        }
+        return detail
+    }
 }
 
 enum Phase { case checking, ready, failed, switching, done, fixing }
@@ -45,7 +66,8 @@ final class VM: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let started = Date()
             let tmp = "/tmp/switcher-out-\(UUID().uuidString).txt"
-            FileManager.default.createFile(atPath: tmp, contents: nil)
+            FileManager.default.createFile(atPath: tmp, contents: nil,
+                                           attributes: [.posixPermissions: 0o600])
             let p = Process()
             p.launchPath = "/bin/bash"
             p.arguments = [self.core] + args
@@ -246,16 +268,30 @@ struct ContentView: View {
     var checksCard: some View {
         VStack(spacing: 0) {
             ForEach(Array(vm.rows.enumerated()), id: \.element.id) { idx, row in
-                HStack(spacing: 10) {
-                    Image(systemName: row.icon)
-                        .frame(width: 20)
-                        .foregroundColor(.white.opacity(0.65))
-                    Text(row.name).font(.callout).foregroundColor(.white.opacity(0.9))
-                    Spacer()
-                    if !row.detail.isEmpty {
-                        Text(row.detail).font(.caption).foregroundColor(.white.opacity(0.45)).lineLimit(1)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 10) {
+                        Image(systemName: row.icon)
+                            .frame(width: 20)
+                            .foregroundColor(.white.opacity(0.65))
+                        Text(row.name).font(.callout).foregroundColor(.white.opacity(0.9))
+                        Spacer()
+                        if row.name != "出口 IP", !row.detail.isEmpty {
+                            Text(row.displayDetail).font(.caption)
+                                .foregroundColor(.white.opacity(0.6))
+                                .lineLimit(row.name == "时区" || row.name == "地区" ? 2 : 1)
+                                .multilineTextAlignment(.trailing)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        stateIcon(row.state)
                     }
-                    stateIcon(row.state)
+                    if row.name == "出口 IP", !row.detail.isEmpty {
+                        Text(row.displayDetail)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                            .lineSpacing(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
                 }
                 .padding(.vertical, 7).padding(.horizontal, 12)
                 if idx < vm.rows.count - 1 {

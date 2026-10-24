@@ -25,6 +25,7 @@ REFERENCES = {
     4: "https://1.1.1.1/cdn-cgi/trace",
     6: "https://[2606:4700:4700::1111]/cdn-cgi/trace",
 }
+DEFAULT_REFERENCE = "https://www.cloudflare.com/cdn-cgi/trace"
 
 
 def normalized_ip(value):
@@ -90,23 +91,28 @@ def reference_egress(version):
             "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "SYSTEMROOT"}
     environment = {k: v for k, v in os.environ.items() if k in keep}
     try:
+        args = ["curl", "-q", "-fsS"]
+        if version:
+            args.append("-" + str(version))
         result = subprocess.run(
-            ["curl", "-q", "-fsS", "-" + str(version), "--noproxy", "*",
+            args + ["--noproxy", "*",
              "--proto", "=https", "--connect-timeout", "3", "--max-time", "5",
-             REFERENCES[version]], env=environment, capture_output=True, text=True, timeout=6)
+             REFERENCES[version] if version else DEFAULT_REFERENCE],
+            env=environment, capture_output=True, text=True, timeout=6)
         if result.returncode:
             return {"state": "unavailable"}
         values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
         address = normalized_ip(values["ip"])
         country = values["loc"]
-        if address.version != version or not address.is_global or len(country) != 2 or not country.isalpha():
+        if ((version and address.version != version) or not address.is_global
+                or len(country) != 2 or not country.isascii() or not country.isalpha()):
             return {"state": "invalid_response"}
         return {"state": "ok", "address": address, "country": country.upper()}
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
         return {"state": "unavailable"}
 
 
-def collect(audit=False, deadline=8.0):
+def collect(audit=False, deadline=8.0, include_default=False, probe_stun=True):
     """Daemon workers bound DNS stalls too; no signal handlers at import time."""
     records, references, lock = [], {}, threading.Lock()
 
@@ -122,9 +128,10 @@ def collect(audit=False, deadline=8.0):
             references[version] = value
 
     workers = [threading.Thread(target=stun_worker, args=(host, port, family), daemon=True)
-               for host, port in SERVERS for family in (socket.AF_INET, socket.AF_INET6)]
+               for host, port in SERVERS for family in (socket.AF_INET, socket.AF_INET6)] if probe_stun else []
     if audit:
-        workers += [threading.Thread(target=reference_worker, args=(v,), daemon=True) for v in (4, 6)]
+        versions = (0, 4, 6) if include_default else (4, 6)
+        workers += [threading.Thread(target=reference_worker, args=(v,), daemon=True) for v in versions]
     stop = time.monotonic() + deadline
     for worker in workers:
         worker.start()
@@ -132,6 +139,31 @@ def collect(audit=False, deadline=8.0):
         worker.join(max(0, stop - time.monotonic()))
     with lock:
         return list(records), dict(references)
+
+
+def egress_summary(references, country):
+    """Keep both families, including a proxy-side IPv6 observed via DNS routing."""
+    selected = {v: references.get(v, {"state": "unavailable"}) for v in (4, 6)}
+    automatic = references.get(0, {})
+    if automatic.get("state") == "ok":
+        version = normalized_ip(automatic["address"]).version
+        if selected[version].get("state") != "ok":
+            selected[version] = automatic
+    available = [ref for ref in selected.values() if ref.get("state") == "ok"]
+    primary = automatic if automatic.get("state") == "ok" else next(iter(available), {})
+    observed = available + ([automatic] if automatic.get("state") == "ok" else [])
+    invalid_country = any(country and ref.get("country") != country for ref in observed)
+    status = "fail" if not available or invalid_country else "ok"
+    lines = []
+    for version, ref in selected.items():
+        if ref.get("state") == "ok":
+            lines.append("IPv%d: %s / %s" % (version, normalized_ip(ref["address"]), ref["country"]))
+        else:
+            lines.append("IPv%d: 未获取" % version)
+    if invalid_country:
+        lines.append("出口国家不一致，期望 " + country)
+    return {"status": status, "detail": " | ".join(lines), "references": selected,
+            "primary_ip": str(primary.get("address", "")), "primary_country": primary.get("country", "")}
 
 
 def evaluate(records, references, country):
@@ -160,7 +192,10 @@ def evaluate(records, references, country):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--audit", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--audit", action="store_true")
+    mode.add_argument("--snapshot", action="store_true", help="egress and UDP audit in one bounded round")
+    mode.add_argument("--egress", action="store_true", help="egress only, without sending STUN packets")
     parser.add_argument("--country", default="")
     args = parser.parse_args()
     country = args.country.upper()
@@ -168,7 +203,19 @@ def main():
         print("fail:目标国家配置异常")
         return 1
     try:
-        records, references = collect(audit=args.audit)
+        snapshot = args.snapshot or args.egress
+        records, references = collect(audit=args.audit or snapshot, include_default=snapshot,
+                                      probe_stun=not args.egress)
+        if snapshot:
+            result = egress_summary(references, country)
+            # Private IPC for the local GUI; never include these addresses in logs.
+            print("primary_ip=" + result["primary_ip"])
+            print("primary_country=" + result["primary_country"])
+            print("egress=" + result["status"] + ":" + result["detail"])
+            if args.snapshot:
+                status, detail = evaluate(records, result["references"], country)
+                print("webrtc=" + status + ":" + detail)
+            return 1 if result["status"] == "fail" or (args.snapshot and status == "fail") else 0
         if args.audit:
             status, detail = evaluate(records, references, country)
             print(status + ":" + detail)

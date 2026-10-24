@@ -1,6 +1,7 @@
 """Exercise check/checkdetail/fix with isolated HOME and fake system tools."""
 import hashlib
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -35,8 +36,11 @@ class WebRTCCommandTests(unittest.TestCase):
         self.write_tool("python3", r'''
 case "$1" in
   */stun-probe.py)
-    [ "$2" = --audit ] && [ "$3" = --country ] || exit 99
-    /bin/cat "$TEST_AUDIT"
+    [ "$2" = --snapshot ] || [ "$2" = --egress ] || exit 99
+    [ "$3" = --country ] || exit 99
+    printf 'primary_ip=2001:4860:4860::8888\nprimary_country=US\n'
+    printf 'egress=%s\n' "${TEST_EGRESS:-ok:IPv4: 8.8.4.4 / US | IPv6: 2001:4860:4860::8888 / US}"
+    printf 'webrtc='; /bin/cat "$TEST_AUDIT"
     case "$(/bin/cat "$TEST_AUDIT")" in fail:*) exit 1;; esac ;;
   */clash-rules.py)
     case "$2" in
@@ -160,6 +164,37 @@ exit 0
         self.loaded.write_text("0")
         result = self.run_cli("checkdetail")
         self.assertIn("规则置顶=warn:", result.stdout)
+
+    def test_detail_exposes_both_addresses_countries_timezone_and_locale(self):
+        result = self.run_cli("checkdetail")
+        self.assertIn("出口IP=ok:IPv4: 8.8.4.4 / US | IPv6: 2001:4860:4860::8888 / US", result.stdout)
+        self.assertIn("时区=ok:America/New_York", result.stdout)
+        self.assertIn("地区=ok:en_US", result.stdout)
+        self.assertEqual(len([x for x in result.stdout.splitlines() if re.match(r"^[^=]+=\b(?:ok|warn|fail):?", x)]), 14)
+
+    def test_second_family_country_error_is_not_hidden_by_good_primary_country(self):
+        env=dict(self.env, TEST_EGRESS="fail:IPv4: 8.8.4.4 / US | IPv6: 2001:4860:4860::8888 / JP")
+        self.assertEqual(self.run_cli("check", env).returncode, 1)
+        self.assertIn("出口IP=fail:", self.run_cli("checkdetail", env).stdout)
+        self.assertEqual(self.run_cli("fix", env).returncode, 1)
+
+    def test_address_caches_remain_private_when_upgrading_existing_files(self):
+        base = self.home / ".claude-switcher"
+        base.mkdir()
+        caches = [base / name for name in ("last-check.txt", "lastip", "iphistory.log")]
+        for path in caches:
+            path.write_text("")
+            path.chmod(0o644)
+        self.assertEqual(self.run_cli("checkdetail").returncode, 0)
+        for path in caches:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_timezone_and_region_errors_report_actual_and_expected_values(self):
+        self.write_tool("readlink", "printf '/usr/share/zoneinfo/Asia/Singapore\\n'\n")
+        self.write_tool("defaults", "printf 'en_SG\\n'\n")
+        result=self.run_cli("checkdetail")
+        self.assertIn("时区=fail:Asia/Singapore (期望 America/New_York)", result.stdout)
+        self.assertIn("地区=fail:en_SG (期望 en_US)", result.stdout)
 
     def test_direct_or_unverified_proxy_policy_blocks_launch_despite_matching_ip(self):
         result = self.run_cli("check", dict(self.env, TEST_PROXY_VALID="0"))

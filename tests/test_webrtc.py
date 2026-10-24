@@ -81,6 +81,73 @@ class StunWireTests(unittest.TestCase):
 
 
 class DualStackAuditTests(unittest.TestCase):
+    def test_egress_retains_each_family_address_and_country(self):
+        refs = references(4, 6)
+        refs[0] = refs[6]
+        result = stun.egress_summary(refs, "SG")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("IPv4: " + V4 + " / SG", result["detail"])
+        self.assertIn("IPv6: " + V6 + " / SG", result["detail"])
+        self.assertEqual(result["primary_ip"], V6)
+
+    def test_proxy_side_ipv6_from_default_request_fills_missing_literal_path(self):
+        refs = references(4)
+        refs[0] = references(6)[6]
+        result = stun.egress_summary(refs, "SG")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("IPv6: " + V6, result["detail"])
+        self.assertEqual(stun.evaluate(records(V4), result["references"], "SG")[0], "warn")
+
+    def test_unavailable_family_is_explicit_and_all_missing_fails(self):
+        result = stun.egress_summary(references(4), "SG")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("IPv6: 未获取", result["detail"])
+        self.assertEqual(stun.egress_summary({}, "SG")["status"], "fail")
+
+    def test_any_observed_country_mismatch_fails_including_default_request(self):
+        for key in (0, 4, 6):
+            refs = references(4, 6)
+            refs[0] = dict(refs[6])
+            refs[key] = dict(refs[key], country="US")
+            with self.subTest(key=key):
+                self.assertEqual(stun.egress_summary(refs, "SG")["status"], "fail")
+
+    def test_snapshot_collects_three_references_once_without_repeating_udp(self):
+        with mock.patch.object(stun, "stun_public_ip", return_value={"state": "no_response"}) as udp, \
+             mock.patch.object(stun, "reference_egress", side_effect=lambda v: references(v or 6)[v or 6]) as http:
+            _, reference = stun.collect(audit=True, include_default=True)
+        self.assertEqual(udp.call_count, 8)
+        self.assertEqual(http.call_count, 3)
+        self.assertEqual(set(reference), {0, 4, 6})
+
+    def test_egress_only_does_not_send_stun_when_proxy_policy_unverified(self):
+        with mock.patch.object(stun, "stun_public_ip") as udp, \
+             mock.patch.object(stun, "reference_egress", return_value={"state": "unavailable"}):
+            stun.collect(audit=True, include_default=True, probe_stun=False)
+        udp.assert_not_called()
+
+    def test_default_reference_is_not_forced_to_ipv4_or_ipv6(self):
+        process = subprocess.CompletedProcess([], 0, "ip=" + V6 + "\nloc=SG\n", "")
+        with mock.patch.object(stun.subprocess, "run", return_value=process) as run:
+            self.assertEqual(stun.reference_egress(0)["state"], "ok")
+        cmd=run.call_args.args[0]
+        self.assertEqual(cmd[-1], stun.DEFAULT_REFERENCE)
+        self.assertNotIn("-0", cmd)
+        self.assertNotIn("-4", cmd)
+        self.assertNotIn("-6", cmd)
+
+    def test_snapshot_exports_ipc_fields_and_fails_if_udp_audit_fails(self):
+        refs=references(4, 6); refs[0]=refs[6]
+        with mock.patch.object(stun, "collect", return_value=([], refs)), \
+             mock.patch("sys.argv", ["stun-probe.py", "--snapshot", "--country", "SG"]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            code=stun.main()
+        self.assertEqual(code, 1)
+        lines=output.getvalue().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertTrue(lines[2].startswith("egress=ok:"))
+        self.assertTrue(lines[3].startswith("webrtc=fail:"))
+
     def test_both_proxy_families_pass_independently(self):
         status, detail = stun.evaluate(records(V4, V6), references(4, 6), "SG")
         self.assertEqual(status, "ok")

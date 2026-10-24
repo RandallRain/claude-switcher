@@ -3,6 +3,8 @@
 # 用法: claude-switch.sh check | status | switch A|B | checkdetail | fix | set-region | update [--auto] | diagnose-proxy
 set -u
 export LC_ALL=en_US.UTF-8
+# 检测输出含用于本机 UI 的地址,缓存和历史记录只允许当前用户读取。
+umask 077
 
 # 随现有单脚本更新分发;在任何账号状态读写、审计/修复/启动之前分派。
 if [ "${1:-}" = "diagnose-proxy" ]; then
@@ -245,6 +247,7 @@ iphist_count() {
     [ -z "$1" ] && { echo 0; return; }
     local HIST="$BASE/iphistory.log"
     local now=$(date +%s)
+    [ ! -f "$HIST" ] || chmod 600 "$HIST"
     echo "$1 $now" >>"$HIST"
     # 裁掉48小时(172800秒)以前的记录
     awk -v cutoff=$((now-172800)) '$2>=cutoff' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
@@ -259,16 +262,17 @@ check() {
     proxy_alive || fails="$fails;代理内核未运行"
     tun_up || fails="$fails;TUN网卡不在线"
 
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-    ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
-    loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
-    [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP异常(${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET)"
+    load_network_snapshot
+    case "$egress_result" in ok:*) ;; *) fails="$fails;双栈出口未获取或国家异常(期望$COUNTRY_TARGET)" ;; esac
     ipwarn=""
     lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
     if [ -n "$ip" ] && [ -n "$lastip" ] && [ "$ip" != "$lastip" ]; then
         ipwarn="注意:出口IP与上次不同($lastip -> $ip)"
     fi
-    [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
+    if [ -n "$ip" ]; then
+        [ ! -f "$BASE/lastip" ] || chmod 600 "$BASE/lastip"
+        echo "$ip" > "$BASE/lastip"
+    fi
 
     # IP 审查:48h 内出口 IP 变化 ≥3 次追加警告(只 warn 不 fail)
     ipn=$(iphist_count "$ip")
@@ -276,8 +280,8 @@ check() {
         ipwarn="${ipwarn:+$ipwarn; }注意:48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
     fi
 
-    tz=$(readlink /etc/localtime 2>/dev/null)
-    [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ] || fails="$fails;时区异常($tz)"
+    tz=$(actual_timezone)
+    [ "$tz" = "$TZ_TARGET" ] || fails="$fails;时区异常($tz)"
 
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     [ "$locale" = "$LOCALE_TARGET" ] || fails="$fails;地区异常($locale)"
@@ -291,7 +295,6 @@ check() {
         *) fails="$fails;DNS未走隧道(返回${dnsip:-空})" ;;
     esac
 
-    wr=$(webrtc_test)
     case "$wr" in
         ok:*|warn:*) ;;
         fail:*) fails="$fails;WebRTC:${wr#fail:}" ;;
@@ -324,14 +327,35 @@ check() {
     return 0
 }
 
-# 三个入口共用双栈审计:同版本参考比较,无响应不再视为“零暴露”。
-webrtc_test() {
+# 每轮并发取得默认/IPv4/IPv6出口和STUN结果,三个入口共用同一份快照。
+load_network_snapshot() {
+    local network_mode="--snapshot" proxy_valid=1 key value network_output
     if [ "$PROXY_MODE" = "clash-verge" ] && \
        ! python3 "$HELPER_DIR/clash-rules.py" proxy-check --directory "$CLASH_DIR" --group "$PROXY_GROUP" >/dev/null 2>&1; then
-        echo 'fail:无法核验Clash的UDP代理策略(可能直连、不支持UDP或规则被覆盖)'
-        return 1
+        network_mode="--egress"; proxy_valid=0
     fi
-    python3 "$HELPER_DIR/stun-probe.py" --audit --country "$COUNTRY_TARGET" 2>/dev/null
+    ip=""; loc=""; egress_result="fail:IPv4: 未获取 | IPv6: 未获取"
+    wr="fail:检测异常(请更新探针)"
+    network_output=$(python3 "$HELPER_DIR/stun-probe.py" "$network_mode" --country "$COUNTRY_TARGET" 2>/dev/null)
+    while IFS='=' read -r key value; do
+        case "$key" in
+            primary_ip) ip="$value" ;;
+            primary_country) loc="$value" ;;
+            egress) egress_result="$value" ;;
+            webrtc) wr="$value" ;;
+        esac
+    done <<< "$network_output"
+    [ "$proxy_valid" -eq 1 ] || wr='fail:无法核验Clash的UDP代理策略(可能直连、不支持UDP或规则被覆盖)'
+    return 0
+}
+
+actual_timezone() {
+    local path
+    path=$(readlink /etc/localtime 2>/dev/null)
+    case "$path" in
+        */zoneinfo/*) echo "${path#*/zoneinfo/}" ;;
+        *) echo '未知' ;;
+    esac
 }
 
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
@@ -345,17 +369,18 @@ checkdetail() {
         echo "代理内核=fail:$(proxy_name) 未运行"
     fi
     if tun_up; then echo 'TUN网卡=ok'; else echo 'TUN网卡=fail:不在线'; fi
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-    ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
-    loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
-    if [ "$loc" = "$COUNTRY_TARGET" ]; then echo "出口IP=ok:$ip/$loc"; else echo "出口IP=fail:${ip:-无}/${loc:-未知}(期望$COUNTRY_TARGET)"; fi
+    load_network_snapshot
+    echo "出口IP=$egress_result"
     lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
     ipst=""; ipdt=""
     if [ -z "$ip" ]; then echo 'IP一致=fail:未获取到出口IP'
     elif [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
     elif [ "$ip" = "$lastip" ]; then ipst="ok"
     else ipst="warn"; ipdt="$lastip → $ip"; fi
-    [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
+    if [ -n "$ip" ]; then
+        [ ! -f "$BASE/lastip" ] || chmod 600 "$BASE/lastip"
+        echo "$ip" > "$BASE/lastip"
+    fi
     # IP 审查:48h 内出口 IP 变化 ≥3 次提示账号画像风险(只 warn 不 fail)
     if [ -n "$ipst" ]; then
         ipn=$(iphist_count "$ip")
@@ -368,10 +393,10 @@ checkdetail() {
         fi
         if [ -z "$ipdt" ]; then echo "IP一致=$ipst"; else echo "IP一致=$ipst:$ipdt"; fi
     fi
-    tz=$(readlink /etc/localtime 2>/dev/null)
-    if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo '时区=ok'; else echo "时区=fail:$tz"; fi
+    tz=$(actual_timezone)
+    if [ "$tz" = "$TZ_TARGET" ]; then echo "时区=ok:$tz"; else echo "时区=fail:$tz (期望 $TZ_TARGET)"; fi
     locale=$(defaults read -g AppleLocale 2>/dev/null)
-    if [ "$locale" = "$LOCALE_TARGET" ]; then echo '地区=ok'; else echo "地区=fail:$locale"; fi
+    if [ "$locale" = "$LOCALE_TARGET" ]; then echo "地区=ok:$locale"; else echo "地区=fail:${locale:-未获取} (期望 $LOCALE_TARGET)"; fi
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭'; fi
     dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
@@ -379,7 +404,6 @@ checkdetail() {
         198.18.*) echo 'DNS=ok:走隧道' ;;
         *) echo "DNS=fail:未走隧道(${dnsip:-空})" ;;
     esac
-    wr=$(webrtc_test)
     case "$wr" in
         ok:*|warn:*|fail:*) echo "WebRTC=$wr" ;;
         *) echo 'WebRTC=fail:检测异常(请更新探针)' ;;
@@ -500,10 +524,10 @@ fix() {
     fi
 
     # B. 时区/IPv6/DNS缓存/保镖(需管理员权限,会弹一次密码框)
-    tz=$(readlink /etc/localtime 2>/dev/null)
+    tz=$(actual_timezone)
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     adminCmds=""
-    [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
+    [ "$tz" != "$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
     echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ && chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist && launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist; "
@@ -568,7 +592,7 @@ ASEOF
     fi
 
     # C. WebRTC:使用与启动/界面相同的双栈判定,不因跨版本比较反复重启。
-    wr=$(webrtc_test)
+    load_network_snapshot
     case "$wr" in
         ok:*) echo "FIX:WebRTC ✓ (${wr#ok:})" ;;
         warn:*) echo "FIX:WebRTC ⚠ (${wr#warn:})" ;;
@@ -577,14 +601,10 @@ ASEOF
     esac
 
     # D. 出口IP最终验证
-    sleep 2
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-    ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
-    loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
-    if [ "$loc" = "$COUNTRY_TARGET" ]; then
-        echo "FIX:出口IP ✓ ($loc)"
+    if [[ "$egress_result" == ok:* ]]; then
+        echo "FIX:双栈出口IP ✓ (已取得的出口国家均为 $COUNTRY_TARGET)"
     else
-        echo "FIX:出口IP ✗ (${loc:-未知},期望$COUNTRY_TARGET) — 请到 $(proxy_name) 里检查线路"
+        echo "FIX:双栈出口IP ✗ (期望$COUNTRY_TARGET) — 请到 $(proxy_name) 里检查线路"
         fix_failed=1
     fi
     echo "FIX:修复流程结束"
@@ -899,6 +919,7 @@ case "${1:-}" in
     check)  check ;;
     checkdetail)
         OUT_FILE="$BASE/last-check.txt"
+        [ ! -f "$OUT_FILE" ] || chmod 600 "$OUT_FILE"
         {
             echo "# $(date '+%F %T') pid=$$ 开始"
             checkdetail
